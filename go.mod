@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/algorand/go-algorand-sdk/v2 v2.12.0
 	github.com/duckdb/duckdb-go/v2 v2.10506.0
+	github.com/mattn/go-sqlite3 v1.14.52
 	golang.org/x/sync v0.23.0
 )
 

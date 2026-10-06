@@ -17,6 +17,29 @@ The first argument is the expected genesis ID (startup fails if algod reports an
 
 Ingestion starts at round 0 and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched.
 
+### Bulk load from an archival node's ledger
+
+Catching up from round 0 over REST is slow. On the archival node's machine, read its block DB directly instead, then copy the DuckDB file to the server:
+
+```
+# on the archival node, as the algod user: any -shm/-wal files SQLite creates must stay algod's
+find <algod datadir> -name ledger.block.sqlite
+LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0
+```
+
+This ingests up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
+
+```
+rsync -P data/mainnet-v1.0.duckdb server:fees-api/data/mainnet-v1.0.duckdb.new
+# on the server
+rm -f data/mainnet-v1.0.duckdb.wal   # a stale WAL would be replayed onto the new file
+mv data/mainnet-v1.0.duckdb.new data/mainnet-v1.0.duckdb
+```
+
+Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival.
+
+It is safe to run beside a live algod: the DB is opened read-only, and WAL readers don't block algod's writes. It does compete with algod for disk, page cache and CPU, so watch algod's lag (`goal node status`) and throttle with `CONCURRENCY`, or stop algod for the duration.
+
 ## Routes
 
 All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC midnight) and RFC3339 are also accepted.
@@ -70,5 +93,6 @@ All params are optional and combine. Rounds are inclusive; `start`/`end` are tim
 | ALGOD_HOST  | Algod host; `;`-separate several for failover                  | http://localhost |
 | ALGOD_PORT  | Algod port; one value, or one per host                         | 8080             |
 | ALGOD_TOKEN | Algod token; one value, or one per host                        |                  |
-| CONCURRENCY | Algod block request concurrency                                | 10               |
+| CONCURRENCY | Concurrent block fetches (algod requests, or LEDGER_DB reads)  | 10               |
 | DB_CHUNKS   | Blocks per batch; each batch is fetched, then inserted at once | 1000             |
+| LEDGER_DB   | Path to an archival `ledger.block.sqlite`: bulk load and exit  |                  |

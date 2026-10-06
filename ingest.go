@@ -65,20 +65,40 @@ func blockFees(b types.Block) (sum uint64) {
 // populated iff Payouts.Enabled, so from then on the header alone gives the fees.
 var payouts atomic.Bool
 
-func fetchBlock(ctx context.Context, a algods, genesisID string, rnd uint64) (block, error) {
-	get := func(headerOnly bool) (types.Block, error) {
-		return call(ctx, a, func(c *algod.Client) (types.Block, error) {
-			b, err := c.Block(rnd).HeaderOnly(headerOnly).Do(ctx)
-			if err == nil && b.GenesisID != genesisID { // a misconfigured failover algod: try the next one
-				err = fmt.Errorf("round %d: algod is on %q, want %q", rnd, b.GenesisID, genesisID)
-			}
-			return b, err
-		})
+// source is where blocks come from: algod over REST, or an archival ledger.block.sqlite.
+type source struct {
+	// get fetches round rnd of genesisID's network, header only or in full.
+	get func(ctx context.Context, rnd uint64, headerOnly bool) (types.Block, error)
+	// tip returns the last round available, waiting for one past next-1 if the source can.
+	tip func(ctx context.Context, next uint64) (uint64, error)
+}
+
+func algodSource(a algods, genesisID string) source {
+	return source{
+		get: func(ctx context.Context, rnd uint64, headerOnly bool) (types.Block, error) {
+			return call(ctx, a, func(c *algod.Client) (types.Block, error) {
+				b, err := c.Block(rnd).HeaderOnly(headerOnly).Do(ctx)
+				if err == nil && b.GenesisID != genesisID { // a misconfigured failover algod: try the next one
+					err = fmt.Errorf("round %d: algod is on %q, want %q", rnd, b.GenesisID, genesisID)
+				}
+				return b, err
+			})
+		},
+		// Returns at once while behind; long-polls for the next block when caught up.
+		tip: func(ctx context.Context, next uint64) (uint64, error) {
+			st, err := call(ctx, a, func(c *algod.Client) (models.NodeStatus, error) {
+				return c.StatusAfterBlock(max(next, 1) - 1).Do(ctx)
+			})
+			return st.LastRound, err
+		},
 	}
+}
+
+func fetchBlock(ctx context.Context, src source, rnd uint64) (block, error) {
 	headerOnly := payouts.Load()
-	b, err := get(headerOnly)
+	b, err := src.get(ctx, rnd, headerOnly)
 	if err == nil && headerOnly && b.Proposer.IsZero() {
-		b, err = get(false) // not expected once payouts are on; recompute from the payset
+		b, err = src.get(ctx, rnd, false) // not expected once payouts are on; recompute from the payset
 	}
 	if err != nil {
 		return block{}, err
@@ -92,38 +112,36 @@ func fetchBlock(ctx context.Context, a algods, genesisID string, rnd uint64) (bl
 	return block{Rnd: rnd, Ts: uint64(b.TimeStamp), Tc: b.TxnCounter, Fees: fees}, nil
 }
 
-// ingest catches up to the algod tip in batches, then follows it block by block.
-// Each batch is fetched in full before one insert transaction, so the table never has gaps.
-func ingest(ctx context.Context, db *sql.DB, a algods, genesisID string, concurrency, chunk int) {
+// ingest catches up to the source's tip in batches, then follows it block by block.
+func ingest(ctx context.Context, db *sql.DB, src source, concurrency, chunk int) {
 	for ctx.Err() == nil {
-		if err := syncToTip(ctx, db, a, genesisID, concurrency, uint64(chunk)); err != nil && ctx.Err() == nil {
+		if err := syncToTip(ctx, db, src, concurrency, uint64(chunk)); err != nil && ctx.Err() == nil {
 			log.Printf("ingest: %v", err)
 			sleep(ctx, retryWait)
 		}
 	}
 }
 
-func syncToTip(ctx context.Context, db *sql.DB, a algods, genesisID string, concurrency int, chunk uint64) error {
+// syncToTip ingests from the last stored round up to the source's tip.
+// Each batch is fetched in full before one insert transaction, so the table never has gaps.
+func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chunk uint64) error {
 	_, _, hi, err := rounds(ctx, db)
 	if err != nil {
 		return err
 	}
 	next := uint64(hi + 1)
-	// Returns at once while behind; long-polls for the next block when caught up.
-	st, err := call(ctx, a, func(c *algod.Client) (models.NodeStatus, error) {
-		return c.StatusAfterBlock(max(next, 1) - 1).Do(ctx)
-	})
+	tip, err := src.tip(ctx, next)
 	if err != nil {
 		return err
 	}
-	for next <= st.LastRound {
-		start, end := time.Now(), min(next+chunk-1, st.LastRound)
+	for next <= tip {
+		start, end := time.Now(), min(next+chunk-1, tip)
 		rows := make([]block, end-next+1)
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(concurrency)
 		for i := range rows {
 			g.Go(func() (err error) {
-				rows[i], err = fetchBlock(gctx, a, genesisID, next+uint64(i))
+				rows[i], err = fetchBlock(gctx, src, next+uint64(i))
 				return err
 			})
 		}

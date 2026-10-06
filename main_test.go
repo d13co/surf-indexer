@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -65,20 +66,35 @@ func fakeAlgod(t *testing.T, genesisID string, blocks *[]types.Block, headerOnly
 	return c
 }
 
+// mk builds round r with payset fees r*1000 + 1. With payouts on it has a proposer and
+// fc = r*7, so the stored fees show which path was taken.
+func mk(r int, payouts bool) types.Block {
+	var b types.Block
+	b.Round, b.TimeStamp, b.TxnCounter = types.Round(r), int64(1000+r), uint64(2*r)
+	b.FeeSink[0] = 'S'
+	b.Payset = []types.SignedTxnInBlock{{SignedTxnWithAD: stxn('A', uint64(r)*1000, stxn('B', 1))}}
+	if payouts {
+		b.Proposer[0], b.FeesCollected = 'P', types.MicroAlgos(r*7)
+	}
+	return b
+}
+
+// checkFees checks that rounds 0-10 hold mk's blocks, with payouts on for rounds 5-9.
+func checkFees(t *testing.T, db *sql.DB) {
+	for r := range 11 {
+		want := uint64(r*1000 + 1)
+		if r >= 5 && r <= 9 {
+			want = uint64(r * 7)
+		}
+		b, err := queryBlock(context.Background(), db, cols+"WHERE rnd = ?", uint64(r))
+		if err != nil || b == nil || b.Fees != want || b.Ts != uint64(1000+r) || b.Tc != uint64(2*r) {
+			t.Errorf("round %d = %+v %v, want fees %d", r, b, err, want)
+		}
+	}
+}
+
 func TestSyncToTip(t *testing.T) {
 	ctx := context.Background()
-	var sink, prop types.Address
-	sink[0], prop[0] = 'S', 'P'
-	// Payset fees are r*1000 + 1; rounds 5-9 have payouts on, with fc = r*7 so the path taken shows.
-	mk := func(r int, payouts bool) types.Block {
-		var b types.Block
-		b.Round, b.TimeStamp, b.TxnCounter, b.FeeSink = types.Round(r), int64(1000+r), uint64(2*r), sink
-		b.Payset = []types.SignedTxnInBlock{{SignedTxnWithAD: stxn('A', uint64(r)*1000, stxn('B', 1))}}
-		if payouts {
-			b.Proposer, b.FeesCollected = prop, types.MicroAlgos(r*7)
-		}
-		return b
-	}
 	var blocks []types.Block
 	for r := range 10 {
 		blocks = append(blocks, mk(r, r >= 5))
@@ -92,7 +108,7 @@ func TestSyncToTip(t *testing.T) {
 	defer db.Close()
 	payouts.Store(false)
 	// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only.
-	if err := syncToTip(ctx, db, algods{good}, "test-v1", 1, 5); err != nil {
+	if err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5); err != nil {
 		t.Fatal(err)
 	}
 	if got := headerOnly.Load(); got != 4 {
@@ -102,18 +118,65 @@ func TestSyncToTip(t *testing.T) {
 	blocks = append(blocks, mk(10, false))
 	other := make([]types.Block, len(blocks)) // zero fees: would show if used
 	wrong := fakeAlgod(t, "other-v1", &other, &headerOnly)
-	if err := syncToTip(ctx, db, algods{wrong, good}, "test-v1", 1, 5); err != nil {
+	if err := syncToTip(ctx, db, algodSource(algods{wrong, good}, "test-v1"), 1, 5); err != nil {
+		t.Fatal(err)
+	}
+	checkFees(t, db)
+}
+
+func TestLedgerSource(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "ledger.block.sqlite")
+	w, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// algod's schema and encoding (go-algorand ledger/store/blockdb BlockPut).
+	if _, err := w.Exec(`CREATE TABLE blocks (rnd integer primary key, proto text, hdrdata blob, blkdata blob, certdata blob)`); err != nil {
 		t.Fatal(err)
 	}
 	for r := range 11 {
-		want := uint64(r*1000 + 1)
-		if r >= 5 && r <= 9 {
-			want = uint64(r * 7)
+		b := mk(r, r >= 5 && r <= 9)
+		b.GenesisID = "test-v1"
+		blk := msgpack.Encode(&b)
+		if r >= 6 && r <= 9 {
+			blk = nil // must be read header-only: a full fetch fails to decode
 		}
-		b, err := queryBlock(ctx, db, cols+"WHERE rnd = ?", uint64(r))
-		if err != nil || b == nil || b.Fees != want || b.Ts != uint64(1000+r) || b.Tc != uint64(2*r) {
-			t.Errorf("round %d = %+v %v, want fees %d", r, b, err, want)
+		if _, err := w.Exec("INSERT INTO blocks VALUES (?, '', ?, ?, NULL)", r, msgpack.Encode(&b.BlockHeader), blk); err != nil {
+			t.Fatal(err)
 		}
+	}
+	w.Close()
+
+	src, ldb, err := ledgerSource(path, "test-v1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ldb.Close()
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	payouts.Store(false)
+	// Same path as TestSyncToTip: 0-5 full (5 flips payouts), 6-9 header-only, 10 refetched in full.
+	if err := syncToTip(ctx, db, src, 1, 5); err != nil {
+		t.Fatal(err)
+	}
+	checkFees(t, db)
+
+	wrong, wdb, err := ledgerSource(path, "other-v1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wdb.Close()
+	odb, err := openDB("", "other-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer odb.Close()
+	if err := syncToTip(ctx, odb, wrong, 1, 5); err == nil {
+		t.Error("ledger on another network should fail")
 	}
 }
 

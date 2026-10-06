@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -70,6 +71,41 @@ func algodClients(concurrency int) (algods, error) {
 	return a, nil
 }
 
+// openData opens data/<dbID>.duckdb, refusing one that isn't contiguous from round 0.
+func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
+	if err := os.MkdirAll("data", 0o755); err != nil {
+		log.Fatal(err)
+	}
+	// DuckDB's file lock also stops a second instance from opening the same DB.
+	db, err := openDB("data/"+dbID+".duckdb", genesisID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if n, lo, hi, err := rounds(ctx, db); err != nil || lo != 0 || hi+1 != n {
+		db.Close()
+		log.Fatalf("db not contiguous from round 0: records=%d minRound=%d maxRound=%d err=%v", n, lo, hi, err)
+	}
+	return db
+}
+
+// importLedger bulk-loads from an archival ledger.block.sqlite up to its current tip, then returns.
+func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency, chunk int) {
+	src, ldb, err := ledgerSource(path, genesisID, concurrency)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ldb.Close()
+	db := openData(ctx, dbID, genesisID)
+	err = syncToTip(ctx, db, src, concurrency, uint64(chunk))
+	if cerr := db.Close(); err == nil { // checkpoints, so the .duckdb file alone is complete
+		err = cerr
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Print("ledger import done, db closed")
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("usage: fees-api <genesisID> [dbID]")
@@ -82,7 +118,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	concurrency := envInt("CONCURRENCY", 10)
+	concurrency, chunk := envInt("CONCURRENCY", 10), envInt("DB_CHUNKS", 1000)
+	if path := os.Getenv("LEDGER_DB"); path != "" {
+		importLedger(ctx, path, genesisID, dbID, concurrency, chunk)
+		return
+	}
+
 	a, err := algodClients(concurrency)
 	if err != nil {
 		log.Fatal(err)
@@ -101,22 +142,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := os.MkdirAll("data", 0o755); err != nil {
-		log.Fatal(err)
-	}
-	// DuckDB's file lock also stops a second instance from opening the same DB.
-	db, err := openDB("data/"+dbID+".duckdb", genesisID)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if n, lo, hi, err := rounds(ctx, db); err != nil || lo != 0 || hi+1 != n {
-		db.Close()
-		log.Fatalf("db not contiguous from round 0: records=%d minRound=%d maxRound=%d err=%v", n, lo, hi, err)
-	}
+	db := openData(ctx, dbID, genesisID)
 
 	done := make(chan struct{})
 	go func() {
-		ingest(ctx, db, a, genesisID, concurrency, envInt("DB_CHUNKS", 1000))
+		ingest(ctx, db, algodSource(a, genesisID), concurrency, chunk)
 		close(done)
 	}()
 
