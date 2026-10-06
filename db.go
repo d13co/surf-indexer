@@ -145,7 +145,7 @@ func sumFees(ctx context.Context, db *sql.DB, minRnd, maxRnd, start, end uint64)
 var intervals = map[string]string{"hour": "1 hour", "day": "1 day", "week": "1 week", "month": "1 month"}
 
 type bucket struct {
-	Ts     uint64  `json:"ts"`
+	Ts     int64   `json:"ts"` // negative for a week bucket holding a genesis at ts 0 (private nets)
 	Fees   uint64  `json:"fees"`
 	Txns   uint64  `json:"txns"`
 	Tps    float64 `json:"tps"`
@@ -153,8 +153,9 @@ type bucket struct {
 }
 
 // time_bucket on a naive TIMESTAMP is UTC; weeks start on Monday. txns is the tc delta from the
-// previous bucket, or for the first from the tc before start (param 4), or with no earlier block
-// from its own first tc (genesis has no txns). An empty bucket is skipped, which lag bridges.
+// previous bucket, or for the first from the last block before start (in the same snapshot, so
+// ingest can't slip blocks in between), or with no earlier block from its own first tc (genesis
+// has no txns). An empty bucket is skipped, which lag bridges.
 // ponytail: tps divides by the full bucket length, so a bucket cut by start/end/tip reads low.
 const qSeries = `WITH h AS (
 	SELECT ts // 3600 * 3600 AS h, sum(fees) AS fees, count(*) AS blocks, min(tc) AS lo, max(tc) AS hi
@@ -164,23 +165,14 @@ const qSeries = `WITH h AS (
 		sum(fees)::UBIGINT AS fees, sum(blocks)::UBIGINT AS blocks, min(lo) AS lo, max(hi) AS hi
 	FROM h GROUP BY t
 ), d AS (
-	SELECT t, fees, blocks, hi - coalesce(lag(hi) OVER (ORDER BY t), ?::UBIGINT, lo) AS txns FROM b
+	SELECT t, fees, blocks, hi - coalesce(lag(hi) OVER (ORDER BY t),
+		(SELECT tc FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1), lo) AS txns FROM b
 )
-SELECT epoch(t)::UBIGINT, fees, txns, txns / (epoch(t + ?::INTERVAL) - epoch(t)), blocks FROM d ORDER BY t`
+SELECT epoch(t)::BIGINT, fees, txns, txns / (epoch(t + ?::INTERVAL) - epoch(t)), blocks FROM d ORDER BY t`
 
 // series buckets blocks with ts in [start, end) by interval, a value of intervals.
 func series(ctx context.Context, db *sql.DB, interval string, start, end uint64) ([]bucket, error) {
-	var prev any // tc of the last block before start; nil if none
-	if start > 0 {
-		b, err := queryBlock(ctx, db, qBefore, start-1)
-		if err != nil {
-			return nil, err
-		}
-		if b != nil {
-			prev = b.Tc
-		}
-	}
-	rows, err := db.QueryContext(ctx, qSeries, start, end, interval, prev, interval)
+	rows, err := db.QueryContext(ctx, qSeries, start, end, interval, start, interval)
 	if err != nil {
 		return nil, err
 	}

@@ -279,11 +279,13 @@ func TestSeries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	// Rounds 0-1 in hour 0, round 2 in hour 1, round 3 in hour 2; genesis tc 1000.
-	if err := insertBatch(ctx, db, []block{{0, 3500, 1000, 0}, {1, 3599, 1004, 100}, {2, 3600, 1010, 200}, {3, 7300, 1011, 300}}); err != nil {
+	// Genesis at ts 0 as on private nets, then blocks from Monday 2025-10-06 (m); hour m+2h is empty.
+	const m = 1759708800
+	if err := insertBatch(ctx, db, []block{{0, 0, 1000, 0}, {1, m + 3599, 1004, 100}, {2, m + 3600, 1010, 200},
+		{3, m + 3*3600, 1011, 300}, {4, m + 4*3600, 1013, 400}}); err != nil {
 		t.Fatal(err)
 	}
-	h := func(ts, fees, txns, blocks uint64) bucket {
+	h := func(ts int64, fees, txns, blocks uint64) bucket {
 		return bucket{ts, fees, txns, float64(txns) / 3600, blocks}
 	}
 	for _, c := range []struct {
@@ -291,14 +293,17 @@ func TestSeries(t *testing.T) {
 		start, end uint64
 		want       []bucket
 	}{
-		{"hour", 0, math.MaxUint32, []bucket{h(0, 100, 4, 2), h(3600, 200, 6, 1), h(7200, 300, 1, 1)}},    // first txns from genesis tc
-		{"hour", 3599, math.MaxUint32, []bucket{h(0, 100, 4, 1), h(3600, 200, 6, 1), h(7200, 300, 1, 1)}}, // from round 0's tc
-		{"hour", 3600, 7200, []bucket{h(3600, 200, 6, 1)}},
-		{"day", 0, math.MaxUint32, []bucket{{0, 600, 11, 11.0 / 86400, 4}}},
-		{"month", 0, math.MaxUint32, []bucket{{0, 600, 11, 11.0 / (31 * 86400), 4}}}, // January
-		{"hour", 8000, math.MaxUint32, []bucket{}},
+		// Genesis txns from its own tc; lag bridges the empty hour.
+		{"hour", 0, math.MaxUint32, []bucket{h(0, 0, 0, 1), h(m, 100, 4, 1), h(m+3600, 200, 6, 1), h(m+3*3600, 300, 1, 1), h(m+4*3600, 400, 2, 1)}},
+		// First txns from round 0, not round 1 at ts == start; round 4 at ts == end is excluded.
+		{"hour", m + 3599, m + 4*3600, []bucket{h(m, 100, 4, 1), h(m+3600, 200, 6, 1), h(m+3*3600, 300, 1, 1)}},
+		{"day", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1}, {m, 1000, 13, 13.0 / 86400, 4}}},
+		{"week", 0, math.MaxUint32, []bucket{{-3 * 86400, 0, 0, 0, 1}, {m, 1000, 13, 13.0 / (7 * 86400), 4}}},    // Mondays 1969-12-29, 2025-10-06
+		{"month", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1}, {m - 5*86400, 1000, 13, 13.0 / (31 * 86400), 4}}}, // 2025-10-01, 31 days
+		{"hour", m + 5*3600, math.MaxUint32, []bucket{}},
 	} {
-		if got, err := series(ctx, db, intervals[c.interval], c.start, c.end); err != nil || !slices.Equal(got, c.want) {
+		// got must be non-nil to encode as [], not null.
+		if got, err := series(ctx, db, intervals[c.interval], c.start, c.end); err != nil || got == nil || !slices.Equal(got, c.want) {
 			t.Errorf("series(%s, %d, %d) = %+v %v, want %+v", c.interval, c.start, c.end, got, err, c.want)
 		}
 	}
