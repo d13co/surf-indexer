@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -114,6 +115,23 @@ func routes(db *sql.DB) http.Handler {
 			return
 		}
 		s, err := sumFees(r.Context(), db, 0, math.MaxUint32, uint64(time.Now().Add(-d).Unix()), math.MaxUint32)
+		reply(w, s, err)
+	})
+
+	mux.HandleFunc("GET /v0/series", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		iv, ok := intervals[cmp.Or(q.Get("interval"), "day")]
+		var e0 error
+		if !ok {
+			e0 = errors.New("interval: want hour, day, week or month")
+		}
+		start, e1 := opt(q, "start", 0, parseTime)
+		end, e2 := opt(q, "end", math.MaxUint32, parseTime)
+		if err := errors.Join(e0, e1, e2); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s, err := series(r.Context(), db, iv, start, end)
 		reply(w, s, err)
 	})
 

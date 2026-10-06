@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -267,6 +268,38 @@ func TestQueries(t *testing.T) {
 		got, err := sumFees(ctx, db, c.minRnd, c.maxRnd, c.start, c.end)
 		if err != nil || got != c.want {
 			t.Errorf("sumFees(%d, %d, %d, %d) = %+v %v, want %+v", c.minRnd, c.maxRnd, c.start, c.end, got, err, c.want)
+		}
+	}
+}
+
+func TestSeries(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Rounds 0-1 in hour 0, round 2 in hour 1, round 3 in hour 2; genesis tc 1000.
+	if err := insertBatch(ctx, db, []block{{0, 3500, 1000, 0}, {1, 3599, 1004, 100}, {2, 3600, 1010, 200}, {3, 7300, 1011, 300}}); err != nil {
+		t.Fatal(err)
+	}
+	h := func(ts, fees, txns, blocks uint64) bucket {
+		return bucket{ts, fees, txns, float64(txns) / 3600, blocks}
+	}
+	for _, c := range []struct {
+		interval   string
+		start, end uint64
+		want       []bucket
+	}{
+		{"hour", 0, math.MaxUint32, []bucket{h(0, 100, 4, 2), h(3600, 200, 6, 1), h(7200, 300, 1, 1)}},    // first txns from genesis tc
+		{"hour", 3599, math.MaxUint32, []bucket{h(0, 100, 4, 1), h(3600, 200, 6, 1), h(7200, 300, 1, 1)}}, // from round 0's tc
+		{"hour", 3600, 7200, []bucket{h(3600, 200, 6, 1)}},
+		{"day", 0, math.MaxUint32, []bucket{{0, 600, 11, 11.0 / 86400, 4}}},
+		{"month", 0, math.MaxUint32, []bucket{{0, 600, 11, 11.0 / (31 * 86400), 4}}}, // January
+		{"hour", 8000, math.MaxUint32, []bucket{}},
+	} {
+		if got, err := series(ctx, db, intervals[c.interval], c.start, c.end); err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("series(%s, %d, %d) = %+v %v, want %+v", c.interval, c.start, c.end, got, err, c.want)
 		}
 	}
 }

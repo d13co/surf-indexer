@@ -85,6 +85,24 @@ All params are optional and combine. Rounds are inclusive; `start`/`end` are tim
 - `blocks`: number of blocks summed
 - `firstRound`, `lastRound`, `firstTs`, `lastTs`: the range actually covered, clipped to indexed data
 
+### Series
+
+`/v0/series?interval=&start=&end=`
+
+Fees and TPS per interval, for charts. `interval` is `hour`, `day` (default), `week` (from Monday) or `month`, in UTC. `start`/`end` are optional times, `[start, end)`.
+
+```
+[{"ts":1759708800,"fees":2145000000,"txns":2700864,"tps":31.26,"blocks":30857}, ...]
+```
+
+- `ts`: bucket start
+- `fees`: sum of block fees in microAlgos
+- `txns`: txns in the bucket's blocks, inner txns included (the `tc` delta)
+- `tps`: `txns` / the bucket's length in seconds
+- `blocks`: number of blocks in the bucket
+
+Buckets with no blocks are omitted. A bucket cut by `start`, `end` or the chain tip is partial, and its `tps` is still divided by the full bucket length.
+
 ## Environment Variables
 
 | name        | description                                                    | default_value    |
