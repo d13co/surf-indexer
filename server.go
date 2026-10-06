@@ -76,7 +76,7 @@ func routes(db *sql.DB) http.Handler {
 			}
 			b, err = blockAt(r.Context(), db, t, dir)
 		case tc != "" && ts == "":
-			n, perr := strconv.ParseUint(tc, 10, 64)
+			n, perr := strconv.ParseUint(tc, 10, 63) // database/sql rejects uint64 params >= 2^63
 			if perr != nil {
 				http.Error(w, "tc: "+perr.Error(), http.StatusBadRequest)
 				return

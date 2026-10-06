@@ -2,10 +2,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/algorand/go-algorand-sdk/v2/client/v2/algod"
+	"github.com/algorand/go-algorand-sdk/v2/client/v2/common/models"
+	"github.com/algorand/go-algorand-sdk/v2/encoding/msgpack"
 	"github.com/algorand/go-algorand-sdk/v2/types"
 )
 
@@ -30,9 +40,102 @@ func TestBlockFees(t *testing.T) {
 	}
 }
 
+// fakeAlgod serves *blocks (stamped with genesisID) and counts header-only requests.
+func fakeAlgod(t *testing.T, genesisID string, blocks *[]types.Block, headerOnly *atomic.Int32) *algod.Client {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v2/status/wait-for-block-after/") {
+			json.NewEncoder(w).Encode(models.NodeStatus{LastRound: uint64(len(*blocks) - 1)})
+			return
+		}
+		var rnd int
+		fmt.Sscanf(r.URL.Path, "/v2/blocks/%d", &rnd)
+		b := (*blocks)[rnd]
+		b.GenesisID = genesisID
+		if r.URL.Query().Get("header-only") == "true" {
+			headerOnly.Add(1)
+			b.Payset = nil
+		}
+		w.Write(msgpack.Encode(models.BlockResponse{Block: b}))
+	}))
+	t.Cleanup(srv.Close)
+	c, err := algod.MakeClient(srv.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestSyncToTip(t *testing.T) {
+	ctx := context.Background()
+	var sink, prop types.Address
+	sink[0], prop[0] = 'S', 'P'
+	// Payset fees are r*1000 + 1; rounds 5-9 have payouts on, with fc = r*7 so the path taken shows.
+	mk := func(r int, payouts bool) types.Block {
+		var b types.Block
+		b.Round, b.TimeStamp, b.TxnCounter, b.FeeSink = types.Round(r), int64(1000+r), uint64(2*r), sink
+		b.Payset = []types.SignedTxnInBlock{{SignedTxnWithAD: stxn('A', uint64(r)*1000, stxn('B', 1))}}
+		if payouts {
+			b.Proposer, b.FeesCollected = prop, types.MicroAlgos(r*7)
+		}
+		return b
+	}
+	var blocks []types.Block
+	for r := range 10 {
+		blocks = append(blocks, mk(r, r >= 5))
+	}
+	var headerOnly atomic.Int32
+	good := fakeAlgod(t, "test-v1", &blocks, &headerOnly)
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	payouts.Store(false)
+	// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only.
+	if err := syncToTip(ctx, db, algods{good}, "test-v1", 1, 5); err != nil {
+		t.Fatal(err)
+	}
+	if got := headerOnly.Load(); got != 4 {
+		t.Errorf("header-only fetches = %d, want 4", got)
+	}
+	// A header-only block without prp is refetched in full; an algod on another network is skipped.
+	blocks = append(blocks, mk(10, false))
+	other := make([]types.Block, len(blocks)) // zero fees: would show if used
+	wrong := fakeAlgod(t, "other-v1", &other, &headerOnly)
+	if err := syncToTip(ctx, db, algods{wrong, good}, "test-v1", 1, 5); err != nil {
+		t.Fatal(err)
+	}
+	for r := range 11 {
+		want := uint64(r*1000 + 1)
+		if r >= 5 && r <= 9 {
+			want = uint64(r * 7)
+		}
+		b, err := queryBlock(ctx, db, cols+"WHERE rnd = ?", uint64(r))
+		if err != nil || b == nil || b.Fees != want || b.Ts != uint64(1000+r) || b.Tc != uint64(2*r) {
+			t.Errorf("round %d = %+v %v, want fees %d", r, b, err, want)
+		}
+	}
+}
+
+func TestOpenDBGenesis(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.duckdb")
+	db, err := openDB(path, "a-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if db, err = openDB(path, "a-v1"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if _, err := openDB(path, "b-v1"); err == nil {
+		t.Error("openDB with another genesis ID should fail")
+	}
+}
+
 func TestQueries(t *testing.T) {
 	ctx := context.Background()
-	db, err := openDB("")
+	db, err := openDB("", "test-v1")
 	if err != nil {
 		t.Fatal(err)
 	}

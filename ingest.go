@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"sync/atomic"
 	"time"
@@ -64,9 +65,15 @@ func blockFees(b types.Block) (sum uint64) {
 // populated iff Payouts.Enabled, so from then on the header alone gives the fees.
 var payouts atomic.Bool
 
-func fetchBlock(ctx context.Context, a algods, rnd uint64) (block, error) {
+func fetchBlock(ctx context.Context, a algods, genesisID string, rnd uint64) (block, error) {
 	get := func(headerOnly bool) (types.Block, error) {
-		return call(ctx, a, func(c *algod.Client) (types.Block, error) { return c.Block(rnd).HeaderOnly(headerOnly).Do(ctx) })
+		return call(ctx, a, func(c *algod.Client) (types.Block, error) {
+			b, err := c.Block(rnd).HeaderOnly(headerOnly).Do(ctx)
+			if err == nil && b.GenesisID != genesisID { // a misconfigured failover algod: try the next one
+				err = fmt.Errorf("round %d: algod is on %q, want %q", rnd, b.GenesisID, genesisID)
+			}
+			return b, err
+		})
 	}
 	headerOnly := payouts.Load()
 	b, err := get(headerOnly)
@@ -87,16 +94,16 @@ func fetchBlock(ctx context.Context, a algods, rnd uint64) (block, error) {
 
 // ingest catches up to the algod tip in batches, then follows it block by block.
 // Each batch is fetched in full before one insert transaction, so the table never has gaps.
-func ingest(ctx context.Context, db *sql.DB, a algods, concurrency, chunk int) {
+func ingest(ctx context.Context, db *sql.DB, a algods, genesisID string, concurrency, chunk int) {
 	for ctx.Err() == nil {
-		if err := syncToTip(ctx, db, a, concurrency, uint64(chunk)); err != nil && ctx.Err() == nil {
+		if err := syncToTip(ctx, db, a, genesisID, concurrency, uint64(chunk)); err != nil && ctx.Err() == nil {
 			log.Printf("ingest: %v", err)
 			sleep(ctx, retryWait)
 		}
 	}
 }
 
-func syncToTip(ctx context.Context, db *sql.DB, a algods, concurrency int, chunk uint64) error {
+func syncToTip(ctx context.Context, db *sql.DB, a algods, genesisID string, concurrency int, chunk uint64) error {
 	_, _, hi, err := rounds(ctx, db)
 	if err != nil {
 		return err
@@ -116,7 +123,7 @@ func syncToTip(ctx context.Context, db *sql.DB, a algods, concurrency int, chunk
 		g.SetLimit(concurrency)
 		for i := range rows {
 			g.Go(func() (err error) {
-				rows[i], err = fetchBlock(gctx, a, next+uint64(i))
+				rows[i], err = fetchBlock(gctx, a, genesisID, next+uint64(i))
 				return err
 			})
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -15,7 +16,8 @@ const schema = `CREATE TABLE IF NOT EXISTS blocks(
 	ts   UINTEGER NOT NULL,
 	tc   UBIGINT  NOT NULL,
 	fees UBIGINT  NOT NULL
-)`
+);
+CREATE TABLE IF NOT EXISTS meta(genesis VARCHAR NOT NULL)`
 
 type block struct {
 	Rnd  uint64 `json:"rnd"`
@@ -24,12 +26,23 @@ type block struct {
 	Fees uint64 `json:"fees"`
 }
 
-func openDB(path string) (*sql.DB, error) {
+// openDB opens or creates the DB, refusing one that holds another network's blocks.
+func openDB(path, genesisID string) (*sql.DB, error) {
 	db, err := sql.Open("duckdb", path)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(schema); err != nil {
+	var stored string
+	if _, err = db.Exec(schema); err == nil {
+		_, err = db.Exec("INSERT INTO meta SELECT ? WHERE NOT EXISTS (SELECT 1 FROM meta)", genesisID)
+	}
+	if err == nil {
+		err = db.QueryRow("SELECT genesis FROM meta").Scan(&stored)
+	}
+	if err == nil && stored != genesisID {
+		err = fmt.Errorf("%s holds %s blocks, not %s", path, stored, genesisID)
+	}
+	if err != nil {
 		db.Close()
 		return nil, err
 	}

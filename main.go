@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/algorand/go-algorand-sdk/v2/client/v2/algod"
 	"github.com/algorand/go-algorand-sdk/v2/types"
@@ -37,7 +39,7 @@ func envInt(name string, def int) int {
 
 // algodClients builds one client per ';'-separated ALGOD_HOST/PORT/TOKEN entry.
 // A single entry is shared by all algods.
-func algodClients() (algods, error) {
+func algodClients(concurrency int) (algods, error) {
 	parts := [][]string{
 		strings.Split(envStr("ALGOD_HOST", "http://localhost"), ";"),
 		strings.Split(envStr("ALGOD_PORT", "8080"), ";"),
@@ -50,10 +52,15 @@ func algodClients() (algods, error) {
 		}
 	}
 	pick := func(p []string, i int) string { return p[min(i, len(p)-1)] }
+	// The default transport has no response timeout (a stuck algod would stall ingest forever)
+	// and keeps only 2 idle conns per host (concurrent fetchers would churn connections).
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 90 * time.Second // > algod's 60s wait-for-block
+	tr.MaxIdleConnsPerHost = concurrency
 	var a algods
 	for i := range n {
 		host, port, token := pick(parts[0], i), pick(parts[1], i), pick(parts[2], i)
-		c, err := algod.MakeClient(host+":"+port, token)
+		c, err := algod.MakeClientWithTransport(host+":"+port, token, nil, tr)
 		if err != nil {
 			return nil, err
 		}
@@ -75,7 +82,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	a, err := algodClients()
+	concurrency := envInt("CONCURRENCY", 10)
+	a, err := algodClients(concurrency)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -87,11 +95,17 @@ func main() {
 		log.Fatalf("genesis ID mismatch, expected %s found %s", genesisID, params.GenesisID)
 	}
 
+	// Listen before opening the DB so a busy port fails fast with a non-zero exit.
+	ln, err := net.Listen("tcp", ":"+envStr("PORT", "8118"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	if err := os.MkdirAll("data", 0o755); err != nil {
 		log.Fatal(err)
 	}
 	// DuckDB's file lock also stops a second instance from opening the same DB.
-	db, err := openDB("data/" + dbID + ".duckdb")
+	db, err := openDB("data/"+dbID+".duckdb", genesisID)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -102,14 +116,14 @@ func main() {
 
 	done := make(chan struct{})
 	go func() {
-		ingest(ctx, db, a, envInt("CONCURRENCY", 10), envInt("DB_CHUNKS", 1000))
+		ingest(ctx, db, a, genesisID, concurrency, envInt("DB_CHUNKS", 1000))
 		close(done)
 	}()
 
-	srv := &http.Server{Addr: ":" + envStr("PORT", "8118"), Handler: routes(db)}
+	srv := &http.Server{Handler: routes(db), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		log.Printf("listening on %s", srv.Addr)
-		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("listening on %s", ln.Addr())
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 			log.Print(err)
 			stop()
 		}
