@@ -37,7 +37,7 @@ sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=...,
 sudo systemctl enable --now surf-indexer@mainnet-v1.0
 ```
 
-Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. `apt upgrade` restarts running instances.
+Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. To switch to another DB of the same network, e.g. one rebuilt with other `PROPOSERS` or `VOTER_ROUNDS`, set `DB_ID=<dbID>` in the env file and restart; remove it to switch back. `apt upgrade` restarts running instances.
 
 ### Releasing
 

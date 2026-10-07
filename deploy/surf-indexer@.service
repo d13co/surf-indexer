@@ -1,7 +1,8 @@
 # One instance per network, named by its genesis ID:
 #   systemctl enable --now surf-indexer@mainnet-v1.0
 # reads /etc/surf-indexer/mainnet-v1.0.env (ALGOD_*, PORT, ...) and keeps its
-# DB in /var/lib/surf-indexer/data/mainnet-v1.0.duckdb.
+# DB in /var/lib/surf-indexer/data/mainnet-v1.0.duckdb, or <DB_ID>.duckdb if
+# the env file sets DB_ID.
 [Unit]
 Description=surf-indexer %i
 After=network-online.target
@@ -11,7 +12,7 @@ Wants=network-online.target
 User=surf-indexer
 Group=surf-indexer
 EnvironmentFile=/etc/surf-indexer/%i.env
-ExecStart=/usr/bin/surf-indexer %i
+ExecStart=/usr/bin/surf-indexer %i $DB_ID
 StateDirectory=surf-indexer
 WorkingDirectory=/var/lib/surf-indexer
 Restart=always
