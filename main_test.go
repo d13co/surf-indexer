@@ -157,6 +157,8 @@ func checkFees(t *testing.T, db *sql.DB) {
 }
 
 func TestSyncToTip(t *testing.T) {
+	defer func(d time.Duration) { retryWait = d }(retryWait)
+	retryWait = 0 // the cert guards fail after call's retries
 	defer func(c config) { track = c }(track)
 	for _, track = range []config{{Proposers: true}, {}} {
 		t.Run(fmt.Sprint(track), func(t *testing.T) {
@@ -180,11 +182,17 @@ func TestSyncToTip(t *testing.T) {
 			if got := headerOnly.Load(); got != 4 {
 				t.Errorf("header-only fetches = %d, want 4", got)
 			}
-			// A header-only block without prp is refetched in full; an algod on another network is skipped.
+			// A header-only block without prp is refetched in full; an algod on another network, or one
+			// whose blocks lack the cert (as from a stripping proxy), is skipped.
 			blocks = append(blocks, mk(10, false))
 			other := make([]blockCert, len(blocks)) // zero fees: would show if used
 			wrong := fakeAlgod(t, "other-v1", &other, &headerOnly)
-			if hi, err := syncToTip(ctx, db, algodSource(algods{wrong, good}, "test-v1"), 1, 5); err != nil || hi != 10 {
+			stripped := slices.Clone(blocks)
+			for i := range stripped {
+				stripped[i].Cert = blockCert{}.Cert
+			}
+			noCert := fakeAlgod(t, "test-v1", &stripped, &headerOnly)
+			if hi, err := syncToTip(ctx, db, algodSource(algods{wrong, noCert, good}, "test-v1"), 1, 5); err != nil || hi != 10 {
 				t.Fatal(hi, err)
 			}
 			checkFees(t, db)
@@ -205,6 +213,8 @@ func TestSyncToTip(t *testing.T) {
 
 // TestVoterWindow checks that only the last VoterRounds rounds get voters, header-only outside it.
 func TestVoterWindow(t *testing.T) {
+	defer func(d time.Duration) { retryWait = d }(retryWait)
+	retryWait = 0 // the cert guards fail after call's retries
 	defer func(c config) { track = c }(track)
 	track = config{VoterRounds: 3}
 	ctx := context.Background()

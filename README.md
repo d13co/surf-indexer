@@ -180,8 +180,9 @@ Clients switching from block-proposers should expect:
 2. `/v0/round/<rnd>` for a round not stored is a 404, not a 200 with an empty body. `/v0/round/0` returns genesis with `"proposer":null`.
 3. Stricter params return 400: `minRound`/`maxRound` must be integers in [0, 2³²) (floats and negatives were coerced), and addresses must pass the checksum (any 58 characters used to return empty results).
 4. No CORS preflight: only `Access-Control-Allow-Origin: *` is set, so a cross-origin request that needs a preflight gets 405. Plain `fetch` GETs are unaffected.
-5. Routes switched off by `PROPOSERS=0` or `VOTER_ROUNDS=0` return 404.
-6. Deployment: the DB file isn't compatible and must be rebuilt. `VOTE_ROUNDS_THRESHOLD` is now `VOTER_ROUNDS`, and the window is the last N rounds rather than N+1. `SYNC_THRESHOLD` and `EMIT_SPEED_EVERY` are gone, `DB_CHUNKS` means blocks per batch (default 1000), and `ALGOD_HOST`/`ALGOD_PORT` default to `http://localhost` and `8080`.
+5. Error bodies are plain text (`not found`, or the param error), not Fastify's JSON (`{"statusCode":400,"error":"Bad Request","message":…}`), and an unknown route gets a plain-text 404. A client that parses error bodies as JSON will throw.
+6. Routes switched off by `PROPOSERS=0` or `VOTER_ROUNDS=0` return 404.
+7. Deployment: the DB file isn't compatible and must be rebuilt. `VOTE_ROUNDS_THRESHOLD` is now `VOTER_ROUNDS`, and the window is the last N rounds rather than N+1. `SYNC_THRESHOLD` and `EMIT_SPEED_EVERY` are gone, `DB_CHUNKS` means blocks per batch (default 1000), and `ALGOD_HOST`/`ALGOD_PORT` default to `http://localhost` and `8080`.
 
 Unchanged: paths, JSON keys, `pp` omitted when 0, the stats shape, eviction ordering and `exists`. Added: `start`/`end` on every ranged route, and explicit oldest-first order where block-proposers relied on insertion order.
 

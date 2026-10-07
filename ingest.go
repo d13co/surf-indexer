@@ -18,7 +18,7 @@ import (
 
 type algods []*algod.Client
 
-const retryWait = 2800 * time.Millisecond
+var retryWait = 2800 * time.Millisecond // a var so tests can skip the waits
 
 func sleep(ctx context.Context, d time.Duration) {
 	select {
@@ -104,6 +104,9 @@ func algodSource(a algods, genesisID string) source {
 				}
 				if err == nil && b.GenesisID != genesisID { // a misconfigured failover algod: try the next one
 					err = fmt.Errorf("round %d: algod is on %q, want %q", rnd, b.GenesisID, genesisID)
+				}
+				if err == nil && cert && rnd > 0 && (b.Cert.Prop.OProp.IsZero() || len(b.Cert.Vote) == 0) { // e.g. a stripping proxy: try the next one
+					err = fmt.Errorf("round %d: algod sent no cert", rnd)
 				}
 				return b, err
 			})
