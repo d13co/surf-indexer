@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -43,7 +43,7 @@ func opt(q url.Values, name string, def uint64, parse func(string) (uint64, erro
 
 func reply(w http.ResponseWriter, v any, err error) {
 	if err != nil {
-		log.Print(err)
+		slog.Error("reply", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -141,7 +141,21 @@ func routes(db *sql.DB) http.Handler {
 	})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		mux.ServeHTTP(w, r)
+		t, sw := time.Now(), &statusWriter{w, http.StatusOK}
+		sw.Header().Set("Access-Control-Allow-Origin", "*")
+		mux.ServeHTTP(sw, r)
+		slog.Info("request", "method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery, "status", sw.status,
+			"ms", float64(time.Since(t).Microseconds())/1000, "remote", r.RemoteAddr)
 	})
+}
+
+// statusWriter records the status code for the request log.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }

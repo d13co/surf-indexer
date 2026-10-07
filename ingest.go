@@ -4,7 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -29,7 +30,7 @@ func sleep(ctx context.Context, d time.Duration) {
 func call[T any](ctx context.Context, a algods, fn func(*algod.Client) (T, error)) (res T, err error) {
 	for try := range 3 {
 		if try > 0 {
-			log.Printf("retry %d: %v", try, err)
+			slog.Warn("retry", "try", try, "err", err)
 			sleep(ctx, retryWait)
 		}
 		for _, c := range a {
@@ -119,12 +120,12 @@ func ingest(ctx context.Context, db *sql.DB, src source, concurrency, chunk int)
 	for ctx.Err() == nil {
 		hi, err := syncToTip(ctx, db, src, concurrency, uint64(chunk))
 		if err != nil && ctx.Err() == nil {
-			log.Printf("ingest: %v", err)
+			slog.Error("ingest", "err", err)
 			sleep(ctx, retryWait)
 		}
 		if err == nil && time.Now().After(upgradesAt) {
 			if err := syncUpgrades(ctx, db, src, concurrency, hi); err != nil && ctx.Err() == nil {
-				log.Printf("upgrades: %v (retrying in 10m)", err)
+				slog.Error("upgrades", "err", err, "retryIn", "10m")
 				upgradesAt = time.Now().Add(10 * time.Minute)
 			}
 		}
@@ -160,11 +161,11 @@ func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chu
 		if err := insertBatch(ctx, db, rows); err != nil {
 			return 0, err
 		}
-		rate := "-" // at tip one block arrives per long-poll, so a rate would only be fetch+insert latency
-		if next != tip {
-			rate = fmt.Sprintf("%.0f", float64(len(rows))/time.Since(start).Seconds())
+		attrs := []any{"from", next, "to", end, "blocks", len(rows), "headerOnly", payouts.Load()}
+		if next != tip { // at tip one block arrives per long-poll, so a rate would only be fetch+insert latency
+			attrs = append(attrs, "blkPerSec", math.Round(float64(len(rows))/time.Since(start).Seconds()))
 		}
-		log.Printf("inserted %d..%d (%d) %s blk/s headerOnly=%t", next, end, len(rows), rate, payouts.Load())
+		slog.Info("inserted", attrs...)
 		next = end + 1
 	}
 	return next - 1, nil

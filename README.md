@@ -17,7 +17,7 @@ The first argument is the expected genesis ID (startup fails if algod reports an
 
 Ingestion starts at round 0 and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched.
 
-Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades:` errors repeat in the log every 10 minutes while fee ingest carries on.
+Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
 
 ### Bulk load from an archival node's ledger
 

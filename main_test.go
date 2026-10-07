@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -315,6 +318,28 @@ func TestSeries(t *testing.T) {
 		if got, err := series(ctx, db, c.interval, c.start, c.end); err != nil || got == nil || !reflect.DeepEqual(got, c.want) {
 			t.Errorf("series(%s, %d, %d) = %+v %v, want %+v", c.interval, c.start, c.end, got, err, c.want)
 		}
+	}
+}
+
+func TestRequestLog(t *testing.T) {
+	var buf bytes.Buffer
+	// Restoring the default slog handler leaves the log package pointed at ours, so restore it too.
+	defer log.SetOutput(log.Writer())
+	defer log.SetFlags(log.Flags())
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	routes(db).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v0/series?interval=second", nil))
+	var got struct {
+		Msg, Path, Query string
+		Status           int
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil || got.Msg != "request" || got.Path != "/v0/series" || got.Query != "interval=second" || got.Status != 400 {
+		t.Errorf("request log = %s %v, want a 400 /v0/series?interval=second request", buf.Bytes(), err)
 	}
 }
 
