@@ -120,10 +120,10 @@ func routes(db *sql.DB) http.Handler {
 
 	mux.HandleFunc("GET /v0/series", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		iv, ok := intervals[cmp.Or(q.Get("interval"), "day")]
+		iv := cmp.Or(q.Get("interval"), "day")
 		var e0 error
-		if !ok {
-			e0 = errors.New("interval: want hour, day, week or month")
+		if _, ok := intervals[iv]; !ok {
+			e0 = errors.New("interval: want block, minute, hour, day, week or month")
 		}
 		start, e1 := opt(q, "start", 0, parseTime)
 		end, e2 := opt(q, "end", math.MaxUint32, parseTime)

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"slices"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -286,7 +286,10 @@ func TestSeries(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := func(ts int64, fees, txns, blocks uint64) bucket {
-		return bucket{ts, fees, txns, float64(txns) / 3600, blocks}
+		return bucket{ts, fees, txns, float64(txns) / 3600, blocks, nil}
+	}
+	blk := func(rnd uint64, ts int64, fees, txns uint64, dt float64) bucket {
+		return bucket{ts, fees, txns, float64(txns) / dt, 1, &rnd}
 	}
 	for _, c := range []struct {
 		interval   string
@@ -297,13 +300,19 @@ func TestSeries(t *testing.T) {
 		{"hour", 0, math.MaxUint32, []bucket{h(0, 0, 0, 1), h(m, 100, 4, 1), h(m+3600, 200, 6, 1), h(m+3*3600, 300, 1, 1), h(m+4*3600, 400, 2, 1)}},
 		// First txns from round 0, not round 1 at ts == start; round 4 at ts == end is excluded.
 		{"hour", m + 3599, m + 4*3600, []bucket{h(m, 100, 4, 1), h(m+3600, 200, 6, 1), h(m+3*3600, 300, 1, 1)}},
-		{"day", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1}, {m, 1000, 13, 13.0 / 86400, 4}}},
-		{"week", 0, math.MaxUint32, []bucket{{-3 * 86400, 0, 0, 0, 1}, {m, 1000, 13, 13.0 / (7 * 86400), 4}}},    // Mondays 1969-12-29, 2025-10-06
-		{"month", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1}, {m - 5*86400, 1000, 13, 13.0 / (31 * 86400), 4}}}, // 2025-10-01, 31 days
+		{"day", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1, nil}, {m, 1000, 13, 13.0 / 86400, 4, nil}}},
+		{"week", 0, math.MaxUint32, []bucket{{-3 * 86400, 0, 0, 0, 1, nil}, {m, 1000, 13, 13.0 / (7 * 86400), 4, nil}}},    // Mondays 1969-12-29, 2025-10-06
+		{"month", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1, nil}, {m - 5*86400, 1000, 13, 13.0 / (31 * 86400), 4, nil}}}, // 2025-10-01, 31 days
 		{"hour", m + 5*3600, math.MaxUint32, []bucket{}},
+		// Pre-summed per minute, not per hour: round 1 lands in minute m+59m.
+		{"minute", m + 3599, m + 3*3600 + 1, []bucket{{m + 3540, 100, 4, 4.0 / 60, 1, nil}, {m + 3600, 200, 6, 6.0 / 60, 1, nil}, {m + 3*3600, 300, 1, 1.0 / 60, 1, nil}}},
+		// Genesis has no txns or duration.
+		{"block", 0, m + 3600, []bucket{{0, 0, 0, 0, 1, new(uint64)}, blk(1, m+3599, 100, 4, m+3599)}},
+		// Round 2's txns and duration from round 1, before start; round 4 at ts == end is excluded.
+		{"block", m + 3600, m + 4*3600, []bucket{blk(2, m+3600, 200, 6, 1), blk(3, m+3*3600, 300, 1, 7200)}},
 	} {
 		// got must be non-nil to encode as [], not null.
-		if got, err := series(ctx, db, intervals[c.interval], c.start, c.end); err != nil || got == nil || !slices.Equal(got, c.want) {
+		if got, err := series(ctx, db, c.interval, c.start, c.end); err != nil || got == nil || !reflect.DeepEqual(got, c.want) {
 			t.Errorf("series(%s, %d, %d) = %+v %v, want %+v", c.interval, c.start, c.end, got, err, c.want)
 		}
 	}
