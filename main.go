@@ -21,6 +21,9 @@ import (
 	"github.com/algorand/go-algorand-sdk/v2/types"
 )
 
+// version is set by the release build.
+var version = "dev"
+
 func envStr(name, def string) string {
 	if v, ok := os.LookupEnv(name); ok {
 		return v
@@ -136,7 +139,11 @@ func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil))) // also routes any log package output
 	if len(os.Args) < 2 {
-		fatal("usage: surf-indexer <genesisID> [dbID]")
+		fatal("usage: surf-indexer <genesisID> [dbID] | version")
+	}
+	if os.Args[1] == "version" {
+		fmt.Println("surf-indexer", version)
+		return
 	}
 	genesisID, dbID := os.Args[1], os.Args[1]
 	if len(os.Args) > 2 {
@@ -154,7 +161,7 @@ func main() {
 	defer stop()
 
 	concurrency, chunk, ledger, port := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1), os.Getenv("LEDGER_DB"), envStr("PORT", "8118")
-	slog.Info("config", "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", ledger, "port", port,
+	slog.Info("config", "version", version, "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", ledger, "port", port,
 		"proposers", track.Proposers, "voterRounds", track.VoterRounds)
 	if ledger != "" {
 		importLedger(ctx, ledger, genesisID, dbID, concurrency, chunk)

@@ -1,0 +1,29 @@
+# Debian package, built by the release workflow for each architecture:
+#
+#   go build -o bin/surf-indexer . && DEB_VERSION=1.2.3 ARCH=amd64 nfpm pkg -p deb -t dist/
+#
+# It starts nothing: each network is a surf-indexer@<genesisID> instance (see the README).
+name: surf-indexer
+arch: ${ARCH}
+version: ${DEB_VERSION}
+maintainer: Tasos Bitsios <bit@d13.co>
+description: Algorand block indexer (fees, upgrades, proposers) on DuckDB
+homepage: https://github.com/d13co/surf-indexer
+section: net
+# CGO (DuckDB) links glibc and libstdc++ dynamically; these are what the
+# release workflow's ubuntu-22.04 build needs.
+depends:
+  - libc6 (>= 2.34)
+  - libstdc++6 (>= 12)
+contents:
+  - src: bin/surf-indexer
+    dst: /usr/bin/surf-indexer
+    file_info: {mode: 0755} # modes are explicit: the build host's umask leaks otherwise
+  - src: deploy/surf-indexer@.service
+    dst: /lib/systemd/system/surf-indexer@.service
+    file_info: {mode: 0644}
+  - dst: /etc/surf-indexer # per-instance env files, which hold algod tokens
+    type: dir
+    file_info: {mode: 0700}
+scripts:
+  postinstall: deploy/postinst.sh

@@ -19,6 +19,30 @@ Ingestion starts at round 0 and catches up in parallel batches, then follows the
 
 Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
 
+### Install from apt
+
+On Debian 12+ and Ubuntu 22.04+ (amd64, arm64), from the apt repository at `https://apt.d13.co`:
+
+```
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://apt.d13.co/key.asc -o /etc/apt/keyrings/d13co.asc
+echo "deb [signed-by=/etc/apt/keyrings/d13co.asc] https://apt.d13.co stable main" | sudo tee /etc/apt/sources.list.d/d13co.list
+sudo apt update && sudo apt install surf-indexer
+```
+
+The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`):
+
+```
+sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=..., PORT=...
+sudo systemctl enable --now surf-indexer@mainnet-v1.0
+```
+
+Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. `apt upgrade` restarts running instances.
+
+### Releasing
+
+Push a `v1.2.3` tag. The release workflow tests, builds the linux amd64 and arm64 binaries and `.deb`s into a GitHub release, then, once approved in the `apt` environment, adds the `.deb`s to the apt repository and signs its index ([.github/apt-publish.sh](.github/apt-publish.sh)).
+
 ### Bulk load from an archival node's ledger
 
 Catching up from round 0 over REST is slow. On the archival node's machine, read its block DB directly instead, then copy the DuckDB file to the server:
