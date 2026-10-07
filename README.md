@@ -50,19 +50,19 @@ Catching up from round 0 over REST is slow. On the archival node's machine, read
 ```
 # on the archival node, as the algod user: any -shm/-wal files SQLite creates must stay algod's
 find <algod datadir> -name ledger.block.sqlite
-LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0 mainnet-v1.0-p
+LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0
 ```
 
 This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
 
 ```
-rsync -P data/mainnet-v1.0-p.duckdb server:surf-indexer/data/mainnet-v1.0-p.duckdb.new
+rsync -P data/mainnet-v1.0.duckdb server:surf-indexer/data/mainnet-v1.0.duckdb.new
 # on the server
-rm -f data/mainnet-v1.0-p.duckdb.wal   # a stale WAL would be replayed onto the new file
-mv data/mainnet-v1.0-p.duckdb.new data/mainnet-v1.0-p.duckdb
+rm -f data/mainnet-v1.0.duckdb.wal   # a stale WAL would be replayed onto the new file
+mv data/mainnet-v1.0.duckdb.new data/mainnet-v1.0.duckdb
 ```
 
-Start the server as usual (`./surf-indexer mainnet-v1.0 mainnet-v1.0-p`); it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS` and `VOTER_ROUNDS`.
+Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS` and `VOTER_ROUNDS`.
 
 With proposers on, rounds before the incentives upgrade read their whole cert from the ledger (~60 KB per round, ~2.8 TB over mainnet's first 46.5M rounds), so the import is I/O-bound.
 
