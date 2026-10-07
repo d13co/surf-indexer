@@ -136,7 +136,7 @@ func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil))) // also routes any log package output
 	if len(os.Args) < 2 {
-		fatal("usage: fees-api <genesisID> [dbID]")
+		fatal("usage: surf-indexer <genesisID> [dbID]")
 	}
 	genesisID, dbID := os.Args[1], os.Args[1]
 	if len(os.Args) > 2 {

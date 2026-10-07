@@ -1,4 +1,4 @@
-module github.com/tasosbit/fees-api
+module github.com/d13co/surf-indexer
 
 go 1.26.0
 
