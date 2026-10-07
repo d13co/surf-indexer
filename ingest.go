@@ -160,8 +160,11 @@ func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chu
 		if err := insertBatch(ctx, db, rows); err != nil {
 			return 0, err
 		}
-		log.Printf("inserted %d..%d (%d) %.0f blk/s headerOnly=%t", next, end, len(rows),
-			float64(len(rows))/time.Since(start).Seconds(), payouts.Load())
+		rate := "-" // at tip one block arrives per long-poll, so a rate would only be fetch+insert latency
+		if next != tip {
+			rate = fmt.Sprintf("%.0f", float64(len(rows))/time.Since(start).Seconds())
+		}
+		log.Printf("inserted %d..%d (%d) %s blk/s headerOnly=%t", next, end, len(rows), rate, payouts.Load())
 		next = end + 1
 	}
 	return next - 1, nil
