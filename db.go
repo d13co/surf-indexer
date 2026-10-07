@@ -246,10 +246,16 @@ func sumFees(ctx context.Context, db *sql.DB, minRnd, maxRnd, start, end uint64)
 	return s, err
 }
 
-// intervals maps the series interval param to a DuckDB INTERVAL. Each is whole UTC hours, so
-// blocks are pre-summed per hour with integer math and only those rows go through time_bucket
-// (2x faster at 55M rows than bucketing every block).
-var intervals = map[string]string{"hour": "1 hour", "day": "1 day", "week": "1 week", "month": "1 month"}
+type interval struct {
+	iv    string // DuckDB INTERVAL
+	grain uint64 // seconds pre-summed per row
+}
+
+// intervals maps the series interval param to a DuckDB INTERVAL. Each is whole UTC minutes or
+// hours, so blocks are pre-summed per grain with integer math and only those rows go through
+// time_bucket (2x faster at 55M rows than bucketing every block). block has no INTERVAL: qBlocks.
+var intervals = map[string]interval{"block": {}, "minute": {"1 minute", 60}, "hour": {"1 hour", 3600},
+	"day": {"1 day", 3600}, "week": {"1 week", 3600}, "month": {"1 month", 3600}}
 
 type bucket struct {
 	Ts     int64   `json:"ts"` // negative for a week bucket holding a genesis at ts 0 (private nets)
@@ -257,6 +263,7 @@ type bucket struct {
 	Txns   uint64  `json:"txns"`
 	Tps    float64 `json:"tps"`
 	Blocks uint64  `json:"blocks"`
+	Rnd    *uint64 `json:"rnd,omitempty"` // block interval only
 }
 
 // time_bucket on a naive TIMESTAMP is UTC; weeks start on Monday. txns is the tc delta from the
@@ -265,7 +272,7 @@ type bucket struct {
 // has no txns). An empty bucket is skipped, which lag bridges.
 // ponytail: tps divides by the full bucket length, so a bucket cut by start/end/tip reads low.
 const qSeries = `WITH h AS (
-	SELECT ts // 3600 * 3600 AS h, sum(fees) AS fees, count(*) AS blocks, min(tc) AS lo, max(tc) AS hi
+	SELECT ts // ?::UINTEGER * ?::UINTEGER AS h, sum(fees) AS fees, count(*) AS blocks, min(tc) AS lo, max(tc) AS hi
 	FROM blocks WHERE ts >= ?::UINTEGER AND ts < ?::UINTEGER GROUP BY h
 ), b AS (
 	SELECT time_bucket(?::INTERVAL, make_timestamp(h::BIGINT * 1000000)) AS t,
@@ -275,11 +282,30 @@ const qSeries = `WITH h AS (
 	SELECT t, fees, blocks, hi - coalesce(lag(hi) OVER (ORDER BY t),
 		(SELECT tc FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1), lo) AS txns FROM b
 )
-SELECT epoch(t)::BIGINT, fees, txns, txns / (epoch(t + ?::INTERVAL) - epoch(t)), blocks FROM d ORDER BY t`
+SELECT epoch(t)::BIGINT, fees, txns, txns / (epoch(t + ?::INTERVAL) - epoch(t)), blocks, NULL FROM d ORDER BY t`
 
-// series buckets blocks with ts in [start, end) by interval, a value of intervals.
+// qBlocks returns blocks with ts in [start, end) as one-block buckets. The last block before start
+// rides along so lag gives the first block its txns and duration; genesis has neither, so 0, and
+// a zero duration gives tps 0.
+const qBlocks = `WITH b AS (
+	(SELECT rnd, ts, tc, fees FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1)
+	UNION ALL
+	SELECT rnd, ts, tc, fees FROM blocks WHERE ts >= ?::UINTEGER AND ts < ?::UINTEGER
+), d AS (
+	SELECT rnd, ts, fees, tc - lag(tc, 1, tc) OVER w AS txns, ts - lag(ts, 1, ts) OVER w AS dt
+	FROM b WINDOW w AS (ORDER BY ts, rnd)
+)
+SELECT ts::BIGINT, fees, txns, coalesce(txns / nullif(dt, 0), 0), 1::UBIGINT, rnd FROM d
+WHERE ts >= ?::UINTEGER ORDER BY ts, rnd`
+
+// series buckets blocks with ts in [start, end) by interval, a key of intervals.
 func series(ctx context.Context, db *sql.DB, interval string, start, end uint64) ([]bucket, error) {
-	rows, err := db.QueryContext(ctx, qSeries, start, end, interval, start, interval)
+	iv := intervals[interval]
+	q, args := qSeries, []any{iv.grain, iv.grain, start, end, iv.iv, start, iv.iv}
+	if interval == "block" {
+		q, args = qBlocks, []any{start, start, end, start}
+	}
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +313,7 @@ func series(ctx context.Context, db *sql.DB, interval string, start, end uint64)
 	out := []bucket{}
 	for rows.Next() {
 		var b bucket
-		if err := rows.Scan(&b.Ts, &b.Fees, &b.Txns, &b.Tps, &b.Blocks); err != nil {
+		if err := rows.Scan(&b.Ts, &b.Fees, &b.Txns, &b.Tps, &b.Blocks, &b.Rnd); err != nil {
 			return nil, err
 		}
 		out = append(out, b)

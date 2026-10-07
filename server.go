@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -47,7 +47,7 @@ func opt(q url.Values, name string, def uint64, parse func(string) (uint64, erro
 
 func reply(w http.ResponseWriter, v any, err error) {
 	if err != nil {
-		log.Print(err)
+		slog.Error("reply", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -65,7 +65,7 @@ func replySQL(w http.ResponseWriter, r *http.Request, db *sql.DB, q string, args
 		return
 	}
 	if err != nil {
-		log.Print(err)
+		slog.Error("reply", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -186,10 +186,10 @@ func routes(db *sql.DB) http.Handler {
 
 	mux.HandleFunc("GET /v0/series", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		iv, ok := intervals[cmp.Or(q.Get("interval"), "day")]
+		iv := cmp.Or(q.Get("interval"), "day")
 		var e0 error
-		if !ok {
-			e0 = errors.New("interval: want hour, day, week or month")
+		if _, ok := intervals[iv]; !ok {
+			e0 = errors.New("interval: want block, minute, hour, day, week or month")
 		}
 		start, e1 := opt(q, "start", 0, parseTime)
 		end, e2 := opt(q, "end", math.MaxUint32, parseTime)
@@ -274,7 +274,21 @@ func routes(db *sql.DB) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		mux.ServeHTTP(w, r)
+		t, sw := time.Now(), &statusWriter{w, http.StatusOK}
+		sw.Header().Set("Access-Control-Allow-Origin", "*")
+		mux.ServeHTTP(sw, r)
+		slog.Info("request", "method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery, "status", sw.status,
+			"ms", float64(time.Since(t).Microseconds())/1000, "remote", r.RemoteAddr)
 	})
+}
+
+// statusWriter records the status code for the request log.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }

@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -27,6 +28,12 @@ func envStr(name, def string) string {
 	return def
 }
 
+// fatal logs at ERROR and exits, like log.Fatal.
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
 func envInt(name string, def, min int) int {
 	v := os.Getenv(name)
 	if v == "" {
@@ -34,7 +41,7 @@ func envInt(name string, def, min int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n < min {
-		log.Fatalf("%s: expected an integer >= %d, got %q", name, min, v)
+		fatal(fmt.Sprintf("%s: expected an integer >= %d", name, min), "got", v)
 	}
 	return n
 }
@@ -46,7 +53,7 @@ func envBool(name string, def bool) bool {
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		log.Fatalf("%s: expected a boolean, got %q", name, v)
+		fatal(name+": expected a boolean", "got", v)
 	}
 	return b
 }
@@ -78,7 +85,11 @@ func algodClients(concurrency int) (algods, error) {
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("algod %d: %s:%s token=%t", i, host, port, token != "")
+		safe := host // a basic-auth password in the URL must not reach the log
+		if u, err := url.Parse(host); err == nil {
+			safe = u.Redacted()
+		}
+		slog.Info("algod", "i", i, "host", safe, "port", port, "token", token != "")
 		a = append(a, c)
 	}
 	return a, nil
@@ -87,16 +98,16 @@ func algodClients(concurrency int) (algods, error) {
 // openData opens data/<dbID>.duckdb, refusing one that isn't contiguous from round 0.
 func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 	if err := os.MkdirAll("data", 0o755); err != nil {
-		log.Fatal(err)
+		fatal("data dir", "err", err)
 	}
 	// DuckDB's file lock also stops a second instance from opening the same DB.
 	db, err := openDB("data/"+dbID+".duckdb", genesisID)
 	if err != nil {
-		log.Fatal(err)
+		fatal("open db", "err", err)
 	}
 	if n, lo, hi, err := rounds(ctx, db); err != nil || lo != 0 || hi+1 != n {
 		db.Close()
-		log.Fatalf("db not contiguous from round 0: records=%d minRound=%d maxRound=%d err=%v", n, lo, hi, err)
+		fatal("db not contiguous from round 0", "records", n, "minRound", lo, "maxRound", hi, "err", err)
 	}
 	return db
 }
@@ -105,7 +116,7 @@ func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency, chunk int) {
 	src, ldb, err := ledgerSource(path, genesisID, concurrency)
 	if err != nil {
-		log.Fatal(err)
+		fatal("ledger source", "err", err)
 	}
 	defer ldb.Close()
 	db := openData(ctx, dbID, genesisID)
@@ -117,14 +128,15 @@ func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency
 		err = cerr
 	}
 	if err != nil {
-		log.Fatal(err)
+		fatal("ledger import", "err", err)
 	}
-	log.Print("ledger import done, db closed")
+	slog.Info("ledger import done, db closed")
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil))) // also routes any log package output
 	if len(os.Args) < 2 {
-		log.Fatal("usage: fees-api <genesisID> [dbID]")
+		fatal("usage: fees-api <genesisID> [dbID]")
 	}
 	genesisID, dbID := os.Args[1], os.Args[1]
 	if len(os.Args) > 2 {
@@ -134,35 +146,37 @@ func main() {
 	// Before either path: importLedger opens the DB and ingests with it too.
 	voterRounds := envInt("VOTER_ROUNDS", 100000, 0)
 	if voterRounds > math.MaxUint32 {
-		log.Fatalf("VOTER_ROUNDS: expected < 2^32, got %d", voterRounds)
+		fatal("VOTER_ROUNDS: expected < 2^32", "got", voterRounds)
 	}
 	track = config{Proposers: envBool("PROPOSERS", true), VoterRounds: uint64(voterRounds)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	concurrency, chunk := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1)
-	if path := os.Getenv("LEDGER_DB"); path != "" {
-		importLedger(ctx, path, genesisID, dbID, concurrency, chunk)
+	concurrency, chunk, ledger, port := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1), os.Getenv("LEDGER_DB"), envStr("PORT", "8118")
+	slog.Info("config", "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", ledger, "port", port,
+		"proposers", track.Proposers, "voterRounds", track.VoterRounds)
+	if ledger != "" {
+		importLedger(ctx, ledger, genesisID, dbID, concurrency, chunk)
 		return
 	}
 
 	a, err := algodClients(concurrency)
 	if err != nil {
-		log.Fatal(err)
+		fatal("algod config", "err", err)
 	}
 	params, err := call(ctx, a, func(c *algod.Client) (types.SuggestedParams, error) { return c.SuggestedParams().Do(ctx) })
 	if err != nil {
-		log.Fatal(err)
+		fatal("algod", "err", err)
 	}
 	if params.GenesisID != genesisID {
-		log.Fatalf("genesis ID mismatch, expected %s found %s", genesisID, params.GenesisID)
+		fatal("genesis ID mismatch", "want", genesisID, "got", params.GenesisID)
 	}
 
 	// Listen before opening the DB so a busy port fails fast with a non-zero exit.
-	ln, err := net.Listen("tcp", ":"+envStr("PORT", "8118"))
+	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatal(err)
+		fatal("listen", "err", err)
 	}
 
 	db := openData(ctx, dbID, genesisID)
@@ -173,21 +187,23 @@ func main() {
 		close(done)
 	}()
 
-	srv := &http.Server{Handler: routes(db), ReadHeaderTimeout: 5 * time.Second}
+	// ErrorLog: net/http's own errors (e.g. handler panics) at ERROR, not the rerouted log package's INFO.
+	srv := &http.Server{Handler: routes(db), ReadHeaderTimeout: 5 * time.Second,
+		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelError)}
 	go func() {
-		log.Printf("listening on %s", ln.Addr())
+		slog.Info("listening", "addr", ln.Addr().String())
 		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
-			log.Print(err)
+			slog.Error("serve", "err", err)
 			stop()
 		}
 	}()
 
 	<-ctx.Done()
-	log.Print("shutting down")
+	slog.Info("shutting down")
 	srv.Shutdown(context.Background())
 	<-done
 	if err := db.Close(); err != nil {
-		log.Print(err)
+		slog.Error("db close", "err", err)
 	}
-	log.Print("db closed")
+	slog.Info("db closed")
 }

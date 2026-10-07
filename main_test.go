@@ -6,11 +6,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -342,7 +345,7 @@ func TestOpenDBGenesis(t *testing.T) {
 	}
 }
 
-func blk(rnd, ts, tc, fees uint64) block { return block{Rnd: rnd, Ts: ts, Tc: tc, Fees: fees} }
+func row(rnd, ts, tc, fees uint64) block { return block{Rnd: rnd, Ts: ts, Tc: tc, Fees: fees} }
 
 func TestQueries(t *testing.T) {
 	ctx := context.Background()
@@ -356,12 +359,12 @@ func TestQueries(t *testing.T) {
 		t.Fatalf("empty rounds = %d %d %d %v", n, lo, hi, err)
 	}
 	rows := []block{
-		blk(0, 100, 1000, 0), // genesis counter starts at 1000
-		blk(1, 110, 1000, 0), // empty block, repeated ts
-		blk(2, 110, 1003, 3000),
-		blk(3, 110, 1005, 2500),
-		blk(4, 120, 1005, 0),
-		blk(5, 125, 1010, 7000),
+		row(0, 100, 1000, 0), // genesis counter starts at 1000
+		row(1, 110, 1000, 0), // empty block, repeated ts
+		row(2, 110, 1003, 3000),
+		row(3, 110, 1005, 2500),
+		row(4, 120, 1005, 0),
+		row(5, 125, 1010, 7000),
 	}
 	if err := insertBatch(ctx, db, rows); err != nil {
 		t.Fatal(err)
@@ -428,12 +431,15 @@ func TestSeries(t *testing.T) {
 	defer db.Close()
 	// Genesis at ts 0 as on private nets, then blocks from Monday 2025-10-06 (m); hour m+2h is empty.
 	const m = 1759708800
-	if err := insertBatch(ctx, db, []block{blk(0, 0, 1000, 0), blk(1, m+3599, 1004, 100), blk(2, m+3600, 1010, 200),
-		blk(3, m+3*3600, 1011, 300), blk(4, m+4*3600, 1013, 400)}); err != nil {
+	if err := insertBatch(ctx, db, []block{row(0, 0, 1000, 0), row(1, m+3599, 1004, 100), row(2, m+3600, 1010, 200),
+		row(3, m+3*3600, 1011, 300), row(4, m+4*3600, 1013, 400)}); err != nil {
 		t.Fatal(err)
 	}
 	h := func(ts int64, fees, txns, blocks uint64) bucket {
-		return bucket{ts, fees, txns, float64(txns) / 3600, blocks}
+		return bucket{ts, fees, txns, float64(txns) / 3600, blocks, nil}
+	}
+	blk := func(rnd uint64, ts int64, fees, txns uint64, dt float64) bucket {
+		return bucket{ts, fees, txns, float64(txns) / dt, 1, &rnd}
 	}
 	for _, c := range []struct {
 		interval   string
@@ -444,15 +450,43 @@ func TestSeries(t *testing.T) {
 		{"hour", 0, math.MaxUint32, []bucket{h(0, 0, 0, 1), h(m, 100, 4, 1), h(m+3600, 200, 6, 1), h(m+3*3600, 300, 1, 1), h(m+4*3600, 400, 2, 1)}},
 		// First txns from round 0, not round 1 at ts == start; round 4 at ts == end is excluded.
 		{"hour", m + 3599, m + 4*3600, []bucket{h(m, 100, 4, 1), h(m+3600, 200, 6, 1), h(m+3*3600, 300, 1, 1)}},
-		{"day", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1}, {m, 1000, 13, 13.0 / 86400, 4}}},
-		{"week", 0, math.MaxUint32, []bucket{{-3 * 86400, 0, 0, 0, 1}, {m, 1000, 13, 13.0 / (7 * 86400), 4}}},    // Mondays 1969-12-29, 2025-10-06
-		{"month", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1}, {m - 5*86400, 1000, 13, 13.0 / (31 * 86400), 4}}}, // 2025-10-01, 31 days
+		{"day", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1, nil}, {m, 1000, 13, 13.0 / 86400, 4, nil}}},
+		{"week", 0, math.MaxUint32, []bucket{{-3 * 86400, 0, 0, 0, 1, nil}, {m, 1000, 13, 13.0 / (7 * 86400), 4, nil}}},    // Mondays 1969-12-29, 2025-10-06
+		{"month", 0, math.MaxUint32, []bucket{{0, 0, 0, 0, 1, nil}, {m - 5*86400, 1000, 13, 13.0 / (31 * 86400), 4, nil}}}, // 2025-10-01, 31 days
 		{"hour", m + 5*3600, math.MaxUint32, []bucket{}},
+		// Pre-summed per minute, not per hour: round 1 lands in minute m+59m.
+		{"minute", m + 3599, m + 3*3600 + 1, []bucket{{m + 3540, 100, 4, 4.0 / 60, 1, nil}, {m + 3600, 200, 6, 6.0 / 60, 1, nil}, {m + 3*3600, 300, 1, 1.0 / 60, 1, nil}}},
+		// Genesis has no txns or duration.
+		{"block", 0, m + 3600, []bucket{{0, 0, 0, 0, 1, new(uint64)}, blk(1, m+3599, 100, 4, m+3599)}},
+		// Round 2's txns and duration from round 1, before start; round 4 at ts == end is excluded.
+		{"block", m + 3600, m + 4*3600, []bucket{blk(2, m+3600, 200, 6, 1), blk(3, m+3*3600, 300, 1, 7200)}},
 	} {
 		// got must be non-nil to encode as [], not null.
-		if got, err := series(ctx, db, intervals[c.interval], c.start, c.end); err != nil || got == nil || !slices.Equal(got, c.want) {
+		if got, err := series(ctx, db, c.interval, c.start, c.end); err != nil || got == nil || !reflect.DeepEqual(got, c.want) {
 			t.Errorf("series(%s, %d, %d) = %+v %v, want %+v", c.interval, c.start, c.end, got, err, c.want)
 		}
+	}
+}
+
+func TestRequestLog(t *testing.T) {
+	var buf bytes.Buffer
+	// Restoring the default slog handler leaves the log package pointed at ours, so restore it too.
+	defer log.SetOutput(log.Writer())
+	defer log.SetFlags(log.Flags())
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	routes(db).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v0/series?interval=second", nil))
+	var got struct {
+		Msg, Path, Query string
+		Status           int
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil || got.Msg != "request" || got.Path != "/v0/series" || got.Query != "interval=second" || got.Status != 400 {
+		t.Errorf("request log = %s %v, want a 400 /v0/series?interval=second request", buf.Bytes(), err)
 	}
 }
 
@@ -551,7 +585,7 @@ func TestOpenDBConfig(t *testing.T) {
 			if err := db.QueryRow("SELECT * FROM config").Scan(&got.Proposers, &got.VoterRounds); err != nil || got != c {
 				t.Errorf("stored config = %+v %v, want %+v", got, err, c)
 			}
-			if err := insertBatch(ctx, db, []block{blk(0, 0, 0, 0)}); err != nil {
+			if err := insertBatch(ctx, db, []block{row(0, 0, 0, 0)}); err != nil {
 				t.Error(err)
 			}
 			db.Close()
@@ -620,7 +654,7 @@ func TestProposerRoutes(t *testing.T) {
 	A, B, C, D := addrOf(1), addrOf(2), addrOf(3), addrOf(4) // in string order
 	const d = 1759708800                                     // 2025-10-06
 	at := func(rnd, ts uint64, prop string, pp uint64, absent, voters []string) block {
-		b := blk(rnd, ts, 0, 0)
+		b := row(rnd, ts, 0, 0)
 		b.prop, b.pp, b.absent, b.voters = prop, pp, absent, voters
 		return b
 	}

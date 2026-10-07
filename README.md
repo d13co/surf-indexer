@@ -17,7 +17,7 @@ The first argument is the expected genesis ID (startup fails if algod reports an
 
 Ingestion starts at round 0 and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks.
 
-Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades:` errors repeat in the log every 10 minutes while fee ingest carries on.
+Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
 
 ### Bulk load from an archival node's ledger
 
@@ -93,7 +93,7 @@ All params are optional and combine. Rounds are inclusive; `start`/`end` are tim
 
 `/v0/series?interval=&start=&end=`
 
-Fees and TPS per interval, for charts. `interval` is `hour`, `day` (default), `week` (from Monday) or `month`, in UTC. `start`/`end` are optional times, `[start, end)`.
+Fees and TPS per interval, for charts. `interval` is `block`, `minute`, `hour`, `day` (default), `week` (from Monday) or `month`, in UTC. `start`/`end` are optional times, `[start, end)`.
 
 ```
 [{"ts":1759708800,"fees":2145000000,"txns":2700864,"tps":31.26,"blocks":30857}, ...]
@@ -104,6 +104,9 @@ Fees and TPS per interval, for charts. `interval` is `hour`, `day` (default), `w
 - `txns`: txns in the bucket's blocks, inner txns included (the `tc` delta)
 - `tps`: `txns` / the bucket's length in seconds
 - `blocks`: number of blocks in the bucket
+- `rnd`: the block's round, `block` interval only
+
+With `interval=block` each bucket is one block: `ts` is its timestamp and `tps` is `txns` / the seconds since the previous block (0 if none or equal timestamps).
 
 Buckets with no blocks are omitted. A bucket cut by `start`, `end` or the chain tip is partial, and its `tps` is still divided by the full bucket length.
 

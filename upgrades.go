@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/algorand/go-algorand-sdk/v2/types"
 	"golang.org/x/sync/errgroup"
@@ -119,7 +119,7 @@ func upgradeStep(ctx context.Context, db *sql.DB, src source, concurrency int, h
 		return 0, err
 	}
 	for _, u := range changed {
-		log.Printf("upgrade proposed at %d: %s -> %s %s", u.Rnd, u.From, u.Proto, u.status())
+		slog.Info("upgrade proposed", "round", u.Rnd, "from", u.From, "proto", u.Proto, "status", u.status())
 	}
 	return nextSample, nil
 }
