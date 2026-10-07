@@ -109,8 +109,8 @@ func TestSyncToTip(t *testing.T) {
 	defer db.Close()
 	payouts.Store(false)
 	// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only.
-	if err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5); err != nil {
-		t.Fatal(err)
+	if hi, err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5); err != nil || hi != 9 {
+		t.Fatal(hi, err)
 	}
 	if got := headerOnly.Load(); got != 4 {
 		t.Errorf("header-only fetches = %d, want 4", got)
@@ -119,8 +119,8 @@ func TestSyncToTip(t *testing.T) {
 	blocks = append(blocks, mk(10, false))
 	other := make([]types.Block, len(blocks)) // zero fees: would show if used
 	wrong := fakeAlgod(t, "other-v1", &other, &headerOnly)
-	if err := syncToTip(ctx, db, algodSource(algods{wrong, good}, "test-v1"), 1, 5); err != nil {
-		t.Fatal(err)
+	if hi, err := syncToTip(ctx, db, algodSource(algods{wrong, good}, "test-v1"), 1, 5); err != nil || hi != 10 {
+		t.Fatal(hi, err)
 	}
 	checkFees(t, db)
 }
@@ -161,7 +161,7 @@ func TestLedgerSource(t *testing.T) {
 	defer db.Close()
 	payouts.Store(false)
 	// Same path as TestSyncToTip: 0-5 full (5 flips payouts), 6-9 header-only, 10 refetched in full.
-	if err := syncToTip(ctx, db, src, 1, 5); err != nil {
+	if _, err := syncToTip(ctx, db, src, 1, 5); err != nil {
 		t.Fatal(err)
 	}
 	checkFees(t, db)
@@ -176,7 +176,7 @@ func TestLedgerSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer odb.Close()
-	if err := syncToTip(ctx, odb, wrong, 1, 5); err == nil {
+	if _, err := syncToTip(ctx, odb, wrong, 1, 5); err == nil {
 		t.Error("ledger on another network should fail")
 	}
 }
@@ -318,5 +318,75 @@ func TestParseTime(t *testing.T) {
 	}
 	if _, err := parseTime("yesterday"); err == nil {
 		t.Error("parseTime(yesterday) should fail")
+	}
+}
+
+func TestSyncUpgrades(t *testing.T) {
+	ctx := context.Background()
+	// On v1, A proposes v2 at 5000 and gets 100 approvals by V=15000: rejected. B proposes v2 at
+	// 15001 and gets 9500 by V=25001: approved, switching at S=45001.
+	var calls atomic.Int32
+	var fail uint64 // a round whose fetch fails, if non-zero
+	src := source{get: func(_ context.Context, rnd uint64, _ bool) (b types.Block, _ error) {
+		calls.Add(1)
+		if fail != 0 && rnd == fail {
+			return b, fmt.Errorf("round %d unavailable", rnd)
+		}
+		r := types.Round(rnd)
+		b.Round, b.TimeStamp, b.CurrentProtocol = r, int64(1000+r), "v1"
+		vote := func(p, approvals, switchOn types.Round) {
+			b.NextProtocol, b.NextProtocolVoteBefore, b.NextProtocolSwitchOn = "v2", p+voteRounds, switchOn
+			b.NextProtocolApprovals = min(r-p+1, approvals)
+			if r == p {
+				b.UpgradePropose = "v2"
+			}
+		}
+		switch {
+		case r >= 5000 && r < 15000:
+			vote(5000, 100, 35000)
+		case r >= 15001 && r < 45001:
+			vote(15001, 9500, 45001)
+		case r >= 45001:
+			b.CurrentProtocol = "v2"
+		}
+		return b, nil
+	}}
+	a := `{"round":5000,"ts":6000,"from":"v1","proto":"v2","voteBefore":15000,"switchOn":35000,`
+	b := `{"round":15001,"ts":16001,"from":"v1","proto":"v2","voteBefore":25001,"switchOn":45001,`
+	done := "[" + a + `"approvals":100,"status":"rejected","switchTs":null},` + b + `"approvals":9500,"status":"applied","switchTs":46001}]`
+	type step struct {
+		hi, fail uint64 // an error is expected iff fail != 0
+		calls    int32  // catches a proposal recorded or settled twice
+		want     string
+	}
+	for _, steps := range [][]step{
+		{
+			{10000, 0, 3, "[" + a + `"approvals":null,"status":"voting","switchTs":null}]`}, // samples 0, 10000; A's P
+			{30000, 0, 7, "[" + a + `"approvals":100,"status":"rejected","switchTs":null},` + b + `"approvals":9500,"status":"approved","switchTs":null}]`},
+			{50000, 0, 3, done}, // sample 40000 shows B again
+			{50000, 0, 0, done},
+		},
+		{
+			// A backfill settles each proposal fully within its first step of 500 samples (+7). The
+			// second step's 6 samples fail, so only they are refetched.
+			{5050000, 5040000, 513, done},
+			{5050000, 0, 6, done},
+		},
+	} {
+		db, err := openDB("", "test-v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range steps {
+			calls.Store(0)
+			fail = s.fail
+			err := syncUpgrades(ctx, db, src, 4, s.hi)
+			u, qerr := queryUpgrades(ctx, db, "ORDER BY rnd")
+			got, _ := json.Marshal(u)
+			if (err != nil) != (s.fail != 0) || qerr != nil || calls.Load() != s.calls || string(got) != s.want {
+				t.Errorf("hi=%d: %s %v %v, %d calls; want %s, %d calls", s.hi, got, err, qerr, calls.Load(), s.want, s.calls)
+			}
+		}
 	}
 }

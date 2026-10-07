@@ -96,7 +96,10 @@ func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency
 	}
 	defer ldb.Close()
 	db := openData(ctx, dbID, genesisID)
-	err = syncToTip(ctx, db, src, concurrency, uint64(chunk))
+	hi, err := syncToTip(ctx, db, src, concurrency, uint64(chunk))
+	if err == nil {
+		err = syncUpgrades(ctx, db, src, concurrency, hi)
+	}
 	if cerr := db.Close(); err == nil { // checkpoints, so the .duckdb file alone is complete
 		err = cerr
 	}

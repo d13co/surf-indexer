@@ -112,27 +112,36 @@ func fetchBlock(ctx context.Context, src source, rnd uint64) (block, error) {
 	return block{Rnd: rnd, Ts: uint64(b.TimeStamp), Tc: b.TxnCounter, Fees: fees}, nil
 }
 
-// ingest catches up to the source's tip in batches, then follows it block by block.
+// ingest catches up to the source's tip in batches, then follows it block by block, syncing
+// upgrades after each pass. A failing upgrades sync backs off on its own, so fees don't lag behind it.
 func ingest(ctx context.Context, db *sql.DB, src source, concurrency, chunk int) {
+	var upgradesAt time.Time
 	for ctx.Err() == nil {
-		if err := syncToTip(ctx, db, src, concurrency, uint64(chunk)); err != nil && ctx.Err() == nil {
+		hi, err := syncToTip(ctx, db, src, concurrency, uint64(chunk))
+		if err != nil && ctx.Err() == nil {
 			log.Printf("ingest: %v", err)
 			sleep(ctx, retryWait)
+		}
+		if err == nil && time.Now().After(upgradesAt) {
+			if err := syncUpgrades(ctx, db, src, concurrency, hi); err != nil && ctx.Err() == nil {
+				log.Printf("upgrades: %v (retrying in 10m)", err)
+				upgradesAt = time.Now().Add(10 * time.Minute)
+			}
 		}
 	}
 }
 
-// syncToTip ingests from the last stored round up to the source's tip.
+// syncToTip ingests from the last stored round up to the source's tip, and returns the last stored round.
 // Each batch is fetched in full before one insert transaction, so the table never has gaps.
-func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chunk uint64) error {
+func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chunk uint64) (uint64, error) {
 	_, _, hi, err := rounds(ctx, db)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	next := uint64(hi + 1)
 	tip, err := src.tip(ctx, next)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for next <= tip {
 		start, end := time.Now(), min(next+chunk-1, tip)
@@ -146,14 +155,14 @@ func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chu
 			})
 		}
 		if err := g.Wait(); err != nil {
-			return err
+			return 0, err
 		}
 		if err := insertBatch(ctx, db, rows); err != nil {
-			return err
+			return 0, err
 		}
 		log.Printf("inserted %d..%d (%d) %.0f blk/s headerOnly=%t", next, end, len(rows),
 			float64(len(rows))/time.Since(start).Seconds(), payouts.Load())
 		next = end + 1
 	}
-	return nil
+	return next - 1, nil
 }

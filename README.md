@@ -17,6 +17,8 @@ The first argument is the expected genesis ID (startup fails if algod reports an
 
 Ingestion starts at round 0 and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched.
 
+Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades:` errors repeat in the log every 10 minutes while fee ingest carries on.
+
 ### Bulk load from an archival node's ledger
 
 Catching up from round 0 over REST is slow. On the archival node's machine, read its block DB directly instead, then copy the DuckDB file to the server:
@@ -27,7 +29,7 @@ find <algod datadir> -name ledger.block.sqlite
 LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0
 ```
 
-This ingests up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
+This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
 
 ```
 rsync -P data/mainnet-v1.0.duckdb server:fees-api/data/mainnet-v1.0.duckdb.new
@@ -102,6 +104,24 @@ Fees and TPS per interval, for charts. `interval` is `hour`, `day` (default), `w
 - `blocks`: number of blocks in the bucket
 
 Buckets with no blocks are omitted. A bucket cut by `start`, `end` or the chain tip is partial, and its `tps` is still divided by the full bucket length.
+
+### Upgrades
+
+`/v0/upgrades`
+
+Every consensus upgrade proposal, oldest first.
+
+```
+[{"round":46294890,"ts":1737038506,"from":"https://github.com/algorandfoundation/specs/tree/925a464…","proto":"https://github.com/algorandfoundation/specs/tree/236dcc1…","voteBefore":46304890,"switchOn":46512890,"approvals":9157,"status":"applied","switchTs":1737640732}, ...]
+```
+
+- `round`, `ts`: when it was proposed
+- `from`, `proto`: the protocol it was proposed on and the one it proposes
+- `voteBefore`: the round voting ends; approvals count in the rounds before it
+- `switchOn`: the round the new protocol takes effect, if approved
+- `approvals`: final approval count, `null` while voting
+- `status`: `voting`, `rejected`, `approved` (waiting for `switchOn`) or `applied`
+- `switchTs`: timestamp of the `switchOn` block once applied, else `null`
 
 ## Environment Variables
 

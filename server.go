@@ -135,6 +135,11 @@ func routes(db *sql.DB) http.Handler {
 		reply(w, s, err)
 	})
 
+	mux.HandleFunc("GET /v0/upgrades", func(w http.ResponseWriter, r *http.Request) {
+		u, err := queryUpgrades(r.Context(), db, "ORDER BY rnd")
+		reply(w, u, err)
+	})
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		mux.ServeHTTP(w, r)

@@ -17,7 +17,16 @@ const schema = `CREATE TABLE IF NOT EXISTS blocks(
 	tc   UBIGINT  NOT NULL,
 	fees UBIGINT  NOT NULL
 );
-CREATE TABLE IF NOT EXISTS meta(genesis VARCHAR NOT NULL)`
+CREATE TABLE IF NOT EXISTS meta(genesis VARCHAR NOT NULL);
+CREATE TABLE IF NOT EXISTS upgrades(
+	rnd UINTEGER PRIMARY KEY, -- proposed in this round; a PK is cheap on a table this small (unlike blocks)
+	ts UINTEGER NOT NULL, from_proto VARCHAR NOT NULL, proto VARCHAR NOT NULL,
+	vote_before UINTEGER NOT NULL, switch_on UINTEGER NOT NULL,
+	approvals UINTEGER, passed BOOLEAN, -- NULL while voting
+	switch_ts UINTEGER                  -- NULL until applied
+);
+CREATE TABLE IF NOT EXISTS upgrade_sync(next_sample UINTEGER NOT NULL);
+INSERT INTO upgrade_sync SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM upgrade_sync)`
 
 type block struct {
 	Rnd  uint64 `json:"rnd"`
@@ -184,6 +193,53 @@ func series(ctx context.Context, db *sql.DB, interval string, start, end uint64)
 			return nil, err
 		}
 		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// upgrade is a consensus upgrade proposal. Nullable columns are pointers.
+type upgrade struct {
+	Rnd        uint64  `json:"round"`
+	Ts         uint64  `json:"ts"`
+	From       string  `json:"from"`
+	Proto      string  `json:"proto"`
+	VoteBefore uint64  `json:"voteBefore"`
+	SwitchOn   uint64  `json:"switchOn"`
+	Approvals  *uint64 `json:"approvals"`
+	Passed     *bool   `json:"-"`
+	Status     string  `json:"status"`
+	SwitchTs   *uint64 `json:"switchTs"`
+}
+
+func (u upgrade) status() string {
+	switch {
+	case u.Passed == nil:
+		return "voting"
+	case !*u.Passed:
+		return "rejected"
+	case u.SwitchTs == nil:
+		return "approved"
+	}
+	return "applied"
+}
+
+const qUpgrades = "SELECT rnd, ts, from_proto, proto, vote_before, switch_on, approvals, passed, switch_ts FROM upgrades "
+
+// queryUpgrades returns the upgrades matching where (a WHERE and/or ORDER BY clause).
+func queryUpgrades(ctx context.Context, db *sql.DB, where string) ([]upgrade, error) {
+	rows, err := db.QueryContext(ctx, qUpgrades+where)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []upgrade{}
+	for rows.Next() {
+		var u upgrade
+		if err := rows.Scan(&u.Rnd, &u.Ts, &u.From, &u.Proto, &u.VoteBefore, &u.SwitchOn, &u.Approvals, &u.Passed, &u.SwitchTs); err != nil {
+			return nil, err
+		}
+		u.Status = u.status()
+		out = append(out, u)
 	}
 	return out, rows.Err()
 }
