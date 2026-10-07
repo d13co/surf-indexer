@@ -145,6 +145,11 @@ func fetchBlock(ctx context.Context, src source, rnd uint64, voters bool) (block
 		return block{}, fmt.Errorf("round %d: no proposer or votes in its cert", rnd)
 	}
 	blk := block{Rnd: rnd, Ts: uint64(b.TimeStamp), Tc: b.TxnCounter, Fees: fees}
+	// tc only started at an upgrade (mainnet round 3317192, at 0), so before it count the payset;
+	// none had inner txns yet. A header-only block has tc > 0: payouts came long after tc.
+	if b.TxnCounter == 0 {
+		blk.txns = uint64(len(b.Payset))
+	}
 	if track.Proposers {
 		if !prop.IsZero() {
 			blk.prop = prop.String()

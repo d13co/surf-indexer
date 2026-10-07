@@ -157,6 +157,10 @@ func checkFees(t *testing.T, db *sql.DB) {
 	if got := strs(t, db, "SELECT rnd || ' ' || acct FROM evictions ORDER BY rnd"); len(got)+len(evictions) > 0 && !slices.Equal(got, evictions) {
 		t.Errorf("evictions = %q, want %q", got, evictions)
 	}
+	// Only round 0 has tc 0, so only its payset is counted.
+	if got := strs(t, db, "SELECT rnd || ' ' || txns FROM blocks WHERE txns > 0"); !slices.Equal(got, []string{"0 1"}) {
+		t.Errorf("txns = %q, want round 0's 1", got)
+	}
 }
 
 func TestSyncToTip(t *testing.T) {
@@ -569,6 +573,32 @@ func TestSyncUpgrades(t *testing.T) {
 				t.Errorf("hi=%d: %s %v %v, %d calls; want %s, %d calls", s.hi, got, err, qerr, calls.Load(), s.want, s.calls)
 			}
 		}
+	}
+}
+
+// TestSeriesBeforeTc checks that blocks from before tc existed count their own txns.
+func TestSeriesBeforeTc(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	pre := func(rnd, ts, txns uint64) block { b := row(rnd, ts, 0, 0); b.txns = txns; return b }
+	// tc starts at round 3, counting its own 4 txns.
+	if err := insertBatch(ctx, db, []block{pre(0, 0, 0), pre(1, 10, 2), pre(2, 20, 3), row(3, 30, 4, 0), row(4, 40, 5, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := series(ctx, db, "day", 0, math.MaxUint32); err != nil || len(got) != 1 || got[0].Txns != 10 {
+		t.Errorf("day = %+v %v, want 10 txns", got, err)
+	}
+	var txns []uint64
+	got, err := series(ctx, db, "block", 0, math.MaxUint32)
+	for _, b := range got {
+		txns = append(txns, b.Txns)
+	}
+	if err != nil || !slices.Equal(txns, []uint64{0, 2, 3, 4, 1}) {
+		t.Errorf("block txns = %v %v, want [0 2 3 4 1]", txns, err)
 	}
 }
 

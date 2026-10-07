@@ -29,6 +29,8 @@ find <algod datadir> -name ledger.block.sqlite
 LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0 mainnet-v1.0-p
 ```
 
+What gets imported is set by `PROPOSERS` and `VOTER_ROUNDS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0` and drop the `-p` DB name.
+
 This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
 
 ```
@@ -70,7 +72,7 @@ Returns `{"rnd":46512890,"ts":1737640732,"tc":2713939481,"fees":86000}`, or 404.
 
 - `rnd`: round
 - `ts`: block timestamp
-- `tc`: txn counter after this block (cumulative, inner txns included)
+- `tc`: txn counter after this block (cumulative, inner txns included). It only exists from the upgrade that added it (mainnet round 3317192, 2019-11-26), where it started at 0, so it is 0 before.
 - `fees`: fees paid in this block in microAlgos, inner txns included. This equals the header's `fc`; blocks before the incentives upgrade are computed from their txns using the same rule.
 
 ### Fee sums
@@ -101,7 +103,7 @@ Fees and TPS per interval, for charts. `interval` is `block`, `minute`, `hour`, 
 
 - `ts`: bucket start
 - `fees`: sum of block fees in microAlgos
-- `txns`: txns in the bucket's blocks, inner txns included (the `tc` delta)
+- `txns`: txns in the bucket's blocks, inner txns included (the `tc` delta, or each block's own txns before `tc` existed). A DB built by an older version counts none before mainnet round 3317192: rebuild it to fill them.
 - `tps`: `txns` / the bucket's length in seconds
 - `blocks`: number of blocks in the bucket
 - `rnd`: the block's round, `block` interval only

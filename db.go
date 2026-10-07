@@ -17,6 +17,7 @@ const schema = `CREATE TABLE IF NOT EXISTS blocks(
 	ts   UINTEGER NOT NULL,
 	tc   UBIGINT  NOT NULL,
 	fees UBIGINT  NOT NULL,
+	txns UINTEGER NOT NULL, -- the block's own txns while tc is 0 (before the upgrade that added it), else 0
 	prop VARCHAR, -- proposer address; NULL for genesis (no cert) or when not tracked
 	pp   UBIGINT  -- proposer payout; NULL when not tracked
 );
@@ -40,6 +41,7 @@ type block struct {
 	Tc   uint64 `json:"tc"`
 	Fees uint64 `json:"fees"`
 
+	txns           uint64 // the block's own txns while Tc is 0, else 0
 	prop           string // "" for genesis or when not tracked
 	pp             uint64
 	absent, voters []string
@@ -111,6 +113,9 @@ func setup(db *sql.DB, path, genesisID string) error {
 			_, err = tx.Exec("ALTER TABLE blocks ADD COLUMN pp UBIGINT")
 		}
 	}
+	if err == nil { // a DB from before txns counts none while tc is 0: rebuild it to fill them
+		_, err = tx.Exec("ALTER TABLE blocks ADD COLUMN IF NOT EXISTS txns UINTEGER DEFAULT 0")
+	}
 	if err == nil {
 		_, err = tx.Exec("DELETE FROM config")
 	}
@@ -133,10 +138,10 @@ func rounds(ctx context.Context, db *sql.DB) (n, lo, hi int64, err error) {
 // or not at all, then drops voters that fell out of the window.
 // List params + unnest is ~20x faster than a prepared INSERT per row.
 func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
-	var rnd, ts, tc, fees, pp, arnd, vrnd []uint64
+	var rnd, ts, tc, fees, txns, pp, arnd, vrnd []uint64
 	var prop, absent, voters []string
 	for _, r := range rows {
-		rnd, ts, tc, fees = append(rnd, r.Rnd), append(ts, r.Ts), append(tc, r.Tc), append(fees, r.Fees)
+		rnd, ts, tc, fees, txns = append(rnd, r.Rnd), append(ts, r.Ts), append(tc, r.Tc), append(fees, r.Fees), append(txns, r.txns)
 		prop, pp = append(prop, r.prop), append(pp, r.pp)
 		for _, a := range r.absent {
 			arnd, absent = append(arnd, r.Rnd), append(absent, a)
@@ -152,10 +157,10 @@ func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
 	defer tx.Rollback()
 	// duckdb-go can't bind a NULL inside a list ([]*uint64{nil} is rejected), so "" stands for one.
 	if track.Proposers {
-		_, err = tx.ExecContext(ctx, `INSERT INTO blocks (rnd, ts, tc, fees, prop, pp)
-			SELECT unnest($1), unnest($2), unnest($3), unnest($4), nullif(unnest($5), ''), unnest($6)`, rnd, ts, tc, fees, prop, pp)
+		_, err = tx.ExecContext(ctx, `INSERT INTO blocks (rnd, ts, tc, fees, txns, prop, pp)
+			SELECT unnest($1), unnest($2), unnest($3), unnest($4), unnest($5), nullif(unnest($6), ''), unnest($7)`, rnd, ts, tc, fees, txns, prop, pp)
 	} else {
-		_, err = tx.ExecContext(ctx, "INSERT INTO blocks (rnd, ts, tc, fees) SELECT unnest(?), unnest(?), unnest(?), unnest(?)", rnd, ts, tc, fees)
+		_, err = tx.ExecContext(ctx, "INSERT INTO blocks (rnd, ts, tc, fees, txns) SELECT unnest(?), unnest(?), unnest(?), unnest(?), unnest(?)", rnd, ts, tc, fees, txns)
 	}
 	if err == nil && len(arnd) > 0 {
 		_, err = tx.ExecContext(ctx, "INSERT INTO evictions SELECT unnest(?), unnest(?)", arnd, absent)
@@ -269,30 +274,31 @@ type bucket struct {
 // time_bucket on a naive TIMESTAMP is UTC; weeks start on Monday. txns is the tc delta from the
 // previous bucket, or for the first from the last block before start (in the same snapshot, so
 // ingest can't slip blocks in between), or with no earlier block from its own first tc (genesis
-// has no txns). An empty bucket is skipped, which lag bridges.
+// has no txns). An empty bucket is skipped, which lag bridges. Blocks from before tc existed
+// (tc 0, so no delta) add their own txns.
 // ponytail: tps divides by the full bucket length, so a bucket cut by start/end/tip reads low.
 const qSeries = `WITH h AS (
-	SELECT ts // ?::UINTEGER * ?::UINTEGER AS h, sum(fees) AS fees, count(*) AS blocks, min(tc) AS lo, max(tc) AS hi
+	SELECT ts // ?::UINTEGER * ?::UINTEGER AS h, sum(fees) AS fees, count(*) AS blocks, min(tc) AS lo, max(tc) AS hi, sum(txns) AS n
 	FROM blocks WHERE ts >= ?::UINTEGER AND ts < ?::UINTEGER GROUP BY h
 ), b AS (
 	SELECT time_bucket(?::INTERVAL, make_timestamp(h::BIGINT * 1000000)) AS t,
-		sum(fees)::UBIGINT AS fees, sum(blocks)::UBIGINT AS blocks, min(lo) AS lo, max(hi) AS hi
+		sum(fees)::UBIGINT AS fees, sum(blocks)::UBIGINT AS blocks, min(lo) AS lo, max(hi) AS hi, sum(n)::UBIGINT AS n
 	FROM h GROUP BY t
 ), d AS (
 	SELECT t, fees, blocks, hi - coalesce(lag(hi) OVER (ORDER BY t),
-		(SELECT tc FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1), lo) AS txns FROM b
+		(SELECT tc FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1), lo) + n AS txns FROM b
 )
 SELECT epoch(t)::BIGINT, fees, txns, txns / (epoch(t + ?::INTERVAL) - epoch(t)), blocks, NULL FROM d ORDER BY t`
 
 // qBlocks returns blocks with ts in [start, end) as one-block buckets. The last block before start
 // rides along so lag gives the first block its txns and duration; genesis has neither, so 0, and
-// a zero duration gives tps 0.
+// a zero duration gives tps 0. A block from before tc existed adds its own txns, as in qSeries.
 const qBlocks = `WITH b AS (
-	(SELECT rnd, ts, tc, fees FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1)
+	(SELECT rnd, ts, tc, fees, txns AS n FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1)
 	UNION ALL
-	SELECT rnd, ts, tc, fees FROM blocks WHERE ts >= ?::UINTEGER AND ts < ?::UINTEGER
+	SELECT rnd, ts, tc, fees, txns FROM blocks WHERE ts >= ?::UINTEGER AND ts < ?::UINTEGER
 ), d AS (
-	SELECT rnd, ts, fees, tc - lag(tc, 1, tc) OVER w AS txns, ts - lag(ts, 1, ts) OVER w AS dt
+	SELECT rnd, ts, fees, tc - lag(tc, 1, tc) OVER w + n AS txns, ts - lag(ts, 1, ts) OVER w AS dt
 	FROM b WINDOW w AS (ORDER BY ts, rnd)
 )
 SELECT ts::BIGINT, fees, txns, coalesce(txns / nullif(dt, 0), 0), 1::UBIGINT, rnd FROM d
