@@ -11,12 +11,18 @@ import (
 
 // No PRIMARY KEY on purpose: rows are appended in rnd order and ts/tc never decrease,
 // so row-group zonemaps already prune rnd/ts/tc filters. An ART index would dominate disk and RAM.
+// Addresses stay VARCHAR: DuckDB dictionary-compresses them, so integer ids would save <= 3%.
 const schema = `CREATE TABLE IF NOT EXISTS blocks(
 	rnd  UINTEGER NOT NULL,
 	ts   UINTEGER NOT NULL,
 	tc   UBIGINT  NOT NULL,
-	fees UBIGINT  NOT NULL
+	fees UBIGINT  NOT NULL,
+	prop VARCHAR, -- proposer address; NULL for genesis (no cert) or when not tracked
+	pp   UBIGINT  -- proposer payout; NULL when not tracked
 );
+CREATE TABLE IF NOT EXISTS evictions(rnd UINTEGER NOT NULL, acct VARCHAR NOT NULL); -- header partupdabs
+CREATE TABLE IF NOT EXISTS voters(rnd UINTEGER NOT NULL, voter VARCHAR NOT NULL);   -- last track.VoterRounds rounds only
+CREATE TABLE IF NOT EXISTS config(proposers BOOLEAN NOT NULL, voter_rounds UINTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS meta(genesis VARCHAR NOT NULL);
 CREATE TABLE IF NOT EXISTS upgrades(
 	rnd UINTEGER PRIMARY KEY, -- proposed in this round; a PK is cheap on a table this small (unlike blocks)
@@ -33,29 +39,88 @@ type block struct {
 	Ts   uint64 `json:"ts"`
 	Tc   uint64 `json:"tc"`
 	Fees uint64 `json:"fees"`
+
+	prop           string // "" for genesis or when not tracked
+	pp             uint64
+	absent, voters []string
 }
 
-// openDB opens or creates the DB, refusing one that holds another network's blocks.
+// config is what a DB tracks besides fees. It is fixed once the DB holds a block.
+type config struct {
+	Proposers   bool   // proposer, payout and absent accounts per block
+	VoterRounds uint64 // cert voters of the last VoterRounds rounds; 0: none
+}
+
+var track config // from env at startup; openDB refuses a DB synced with another
+
+// openDB opens or creates the DB, refusing one that holds another network's blocks or was
+// synced with another config than track. A fees-only DB from before config gains prop/pp.
 func openDB(path, genesisID string) (*sql.DB, error) {
 	db, err := sql.Open("duckdb", path)
 	if err != nil {
 		return nil, err
 	}
-	var stored string
-	if _, err = db.Exec(schema); err == nil {
-		_, err = db.Exec("INSERT INTO meta SELECT ? WHERE NOT EXISTS (SELECT 1 FROM meta)", genesisID)
-	}
-	if err == nil {
-		err = db.QueryRow("SELECT genesis FROM meta").Scan(&stored)
-	}
-	if err == nil && stored != genesisID {
-		err = fmt.Errorf("%s holds %s blocks, not %s", path, stored, genesisID)
-	}
-	if err != nil {
+	if err = setup(db, path, genesisID); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// setup runs in one transaction with every read on tx: another pooled connection can't see
+// its uncommitted DDL. A refusal rolls back, leaving the file as it was.
+func setup(db *sql.DB, path, genesisID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var stored string
+	var legacy, hasBlocks bool
+	var have config // a DB without a config row (new, or from before config) tracked nothing
+	if _, err = tx.Exec(schema); err == nil {
+		_, err = tx.Exec("INSERT INTO meta SELECT ? WHERE NOT EXISTS (SELECT 1 FROM meta)", genesisID)
+	}
+	if err == nil {
+		err = tx.QueryRow("SELECT genesis FROM meta").Scan(&stored)
+	}
+	if err == nil && stored != genesisID {
+		return fmt.Errorf("%s holds %s blocks, not %s", path, stored, genesisID)
+	}
+	if err == nil {
+		err = tx.QueryRow(`SELECT count(*) = 0 FROM duckdb_columns() WHERE table_name = 'blocks' AND column_name = 'prop'`).Scan(&legacy)
+	}
+	if err == nil {
+		err = tx.QueryRow("SELECT proposers, voter_rounds FROM config").Scan(&have.Proposers, &have.VoterRounds)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+		}
+	}
+	if err == nil {
+		err = tx.QueryRow("SELECT count(*) > 0 FROM blocks").Scan(&hasBlocks)
+	}
+	if err != nil {
+		return err
+	}
+	if hasBlocks && have != track {
+		return fmt.Errorf("%s was synced with PROPOSERS=%t VOTER_ROUNDS=%d: run with those, or rebuild into a new file (LEDGER_DB) to change them",
+			path, have.Proposers, have.VoterRounds)
+	}
+	if legacy {
+		if _, err = tx.Exec("ALTER TABLE blocks ADD COLUMN prop VARCHAR"); err == nil {
+			_, err = tx.Exec("ALTER TABLE blocks ADD COLUMN pp UBIGINT")
+		}
+	}
+	if err == nil {
+		_, err = tx.Exec("DELETE FROM config")
+	}
+	if err == nil {
+		_, err = tx.Exec("INSERT INTO config VALUES (?, ?)", track.Proposers, track.VoterRounds)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // rounds returns the record count and min/max round. hi is -1 when empty.
@@ -64,15 +129,48 @@ func rounds(ctx context.Context, db *sql.DB) (n, lo, hi int64, err error) {
 	return n, lo, hi, err
 }
 
-// insertBatch appends rows in one statement, so a batch lands whole or not at all.
+// insertBatch appends rows, their evictions and voters in one transaction, so a batch lands whole
+// or not at all, then drops voters that fell out of the window.
 // List params + unnest is ~20x faster than a prepared INSERT per row.
 func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
-	var rnd, ts, tc, fees []uint64
+	var rnd, ts, tc, fees, pp, arnd, vrnd []uint64
+	var prop, absent, voters []string
 	for _, r := range rows {
 		rnd, ts, tc, fees = append(rnd, r.Rnd), append(ts, r.Ts), append(tc, r.Tc), append(fees, r.Fees)
+		prop, pp = append(prop, r.prop), append(pp, r.pp)
+		for _, a := range r.absent {
+			arnd, absent = append(arnd, r.Rnd), append(absent, a)
+		}
+		for _, v := range r.voters {
+			vrnd, voters = append(vrnd, r.Rnd), append(voters, v)
+		}
 	}
-	_, err := db.ExecContext(ctx, "INSERT INTO blocks SELECT unnest(?), unnest(?), unnest(?), unnest(?)", rnd, ts, tc, fees)
-	return err
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// duckdb-go can't bind a NULL inside a list ([]*uint64{nil} is rejected), so "" stands for one.
+	if track.Proposers {
+		_, err = tx.ExecContext(ctx, `INSERT INTO blocks (rnd, ts, tc, fees, prop, pp)
+			SELECT unnest($1), unnest($2), unnest($3), unnest($4), nullif(unnest($5), ''), unnest($6)`, rnd, ts, tc, fees, prop, pp)
+	} else {
+		_, err = tx.ExecContext(ctx, "INSERT INTO blocks (rnd, ts, tc, fees) SELECT unnest(?), unnest(?), unnest(?), unnest(?)", rnd, ts, tc, fees)
+	}
+	if err == nil && len(arnd) > 0 {
+		_, err = tx.ExecContext(ctx, "INSERT INTO evictions SELECT unnest(?), unnest(?)", arnd, absent)
+	}
+	if err == nil && len(vrnd) > 0 {
+		_, err = tx.ExecContext(ctx, "INSERT INTO voters SELECT unnest(?), unnest(?)", vrnd, voters)
+	}
+	// Rows are in rnd order, so whole row groups empty out and are reclaimed at checkpoint.
+	if last := rows[len(rows)-1].Rnd; err == nil && track.VoterRounds > 0 && last >= track.VoterRounds {
+		_, err = tx.ExecContext(ctx, "DELETE FROM voters WHERE rnd <= ?", last-track.VoterRounds)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ts and tc never decrease, so ordering by them equals ordering by rnd; leading with the

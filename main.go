@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -26,16 +27,28 @@ func envStr(name, def string) string {
 	return def
 }
 
-func envInt(name string, def int) int {
+func envInt(name string, def, min int) int {
 	v := os.Getenv(name)
 	if v == "" {
 		return def
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 {
-		log.Fatalf("%s: expected a positive integer, got %q", name, v)
+	if err != nil || n < min {
+		log.Fatalf("%s: expected an integer >= %d, got %q", name, min, v)
 	}
 	return n
+}
+
+func envBool(name string, def bool) bool {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Fatalf("%s: expected a boolean, got %q", name, v)
+	}
+	return b
 }
 
 // algodClients builds one client per ';'-separated ALGOD_HOST/PORT/TOKEN entry.
@@ -118,10 +131,17 @@ func main() {
 		dbID = os.Args[2]
 	}
 
+	// Before either path: importLedger opens the DB and ingests with it too.
+	voterRounds := envInt("VOTER_ROUNDS", 100000, 0)
+	if voterRounds > math.MaxUint32 {
+		log.Fatalf("VOTER_ROUNDS: expected < 2^32, got %d", voterRounds)
+	}
+	track = config{Proposers: envBool("PROPOSERS", true), VoterRounds: uint64(voterRounds)}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	concurrency, chunk := envInt("CONCURRENCY", 10), envInt("DB_CHUNKS", 1000)
+	concurrency, chunk := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1)
 	if path := os.Getenv("LEDGER_DB"); path != "" {
 		importLedger(ctx, path, genesisID, dbID, concurrency, chunk)
 		return

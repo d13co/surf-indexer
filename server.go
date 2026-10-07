@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/algorand/go-algorand-sdk/v2/types"
 )
 
 // parseTime accepts unix seconds, YYYY-MM-DD (UTC midnight) or RFC3339.
@@ -49,6 +53,68 @@ func reply(w http.ResponseWriter, v any, err error) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
+}
+
+// replySQL writes q's single JSON value, built by DuckDB as to_json(...)::VARCHAR (uncast, the
+// driver would unmarshal it). No row is a 404. q takes $n params: a repeated $1 binds one arg.
+func replySQL(w http.ResponseWriter, r *http.Request, db *sql.DB, q string, args ...any) {
+	var s string
+	err := db.QueryRowContext(r.Context(), q, args...).Scan(&s)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		log.Print(err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	io.WriteString(w, s)
+}
+
+// roundRange parses minRound/maxRound and narrows them by the time window [start, end). ts never
+// decreases with rnd, so the window is a contiguous round interval, found by the same zonemap-pruned
+// lookups as /v0/block. An empty range comes back as lo > hi. On a bad param or error it replies.
+func roundRange(w http.ResponseWriter, r *http.Request, db *sql.DB) (lo, hi uint64, ok bool) {
+	q := r.URL.Query()
+	lo, e1 := opt(q, "minRound", 0, parseRound)
+	hi, e2 := opt(q, "maxRound", math.MaxUint32, parseRound)
+	start, e3 := opt(q, "start", 0, parseTime)
+	end, e4 := opt(q, "end", math.MaxUint32, parseTime)
+	if err := errors.Join(e1, e2, e3, e4); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return 0, 0, false
+	}
+	if end == 0 {
+		return 1, 0, true
+	}
+	var err error
+	first, last := &block{Rnd: 0}, &block{Rnd: math.MaxUint32} // unbounded
+	if start > 0 {
+		first, err = blockAt(r.Context(), db, start, "after")
+	}
+	if err == nil && end < math.MaxUint32 {
+		last, err = blockAt(r.Context(), db, end-1, "before")
+	}
+	if err != nil {
+		reply(w, nil, err)
+		return 0, 0, false
+	}
+	if first == nil || last == nil {
+		return 1, 0, true
+	}
+	return max(lo, first.Rnd), min(hi, last.Rnd), true
+}
+
+// addr returns the {addr} path value, replying 400 if it isn't a valid address.
+func addr(w http.ResponseWriter, r *http.Request) (string, bool) {
+	a := r.PathValue("addr")
+	if _, err := types.DecodeAddress(a); err != nil {
+		http.Error(w, "addr: "+err.Error(), http.StatusBadRequest)
+		return "", false
+	}
+	return a, true
 }
 
 var periods = map[string]time.Duration{"24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour, "30d": 30 * 24 * time.Hour}
@@ -139,6 +205,73 @@ func routes(db *sql.DB) http.Handler {
 		u, err := queryUpgrades(r.Context(), db, "ORDER BY rnd")
 		reply(w, u, err)
 	})
+
+	// ranged serves q with the round range as $1, $2 and, for an {addr} pattern, the address as $3.
+	ranged := func(pattern, q string) {
+		withAddr := strings.Contains(pattern, "{addr}")
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			lo, hi, ok := roundRange(w, r, db)
+			if !ok {
+				return
+			}
+			args := []any{lo, hi}
+			if withAddr {
+				a, ok := addr(w, r)
+				if !ok {
+					return
+				}
+				args = append(args, a)
+			}
+			replySQL(w, r, db, q, args...)
+		})
+	}
+	// Each list is built in DuckDB; list() of no rows is NULL, hence the coalesce to [].
+	const in = " rnd BETWEEN $1::UINTEGER AND $2::UINTEGER"
+	if track.Proposers {
+		ranged("GET /v0/proposers", `SELECT coalesce(to_json(list({'proposer': prop, 'blocks': n, 'payouts': p} ORDER BY n DESC, prop))::VARCHAR, '[]')
+			FROM (SELECT prop, count(*) AS n, sum(pp) AS p FROM blocks WHERE prop IS NOT NULL AND`+in+` GROUP BY prop)`)
+		// pp is omitted when 0, as block-proposers did.
+		ranged("GET /v0/proposer/{addr}", `SELECT coalesce(to_json(list(CASE WHEN pp > 0 THEN to_json({'rnd': rnd, 'ts': ts, 'pp': pp})
+			ELSE to_json({'rnd': rnd, 'ts': ts}) END ORDER BY rnd))::VARCHAR, '[]') FROM blocks WHERE prop = $3 AND`+in)
+		// One scan: the range is every block in it (genesis excluded), the rest the proposer's own.
+		ranged("GET /v0/proposer/{addr}/stats", `SELECT to_json({
+			'blocks': count(*) FILTER (WHERE prop = $3),
+			'payouts': coalesce(sum(pp) FILTER (WHERE prop = $3), 0),
+			'suspensions': (SELECT count(*) FROM evictions WHERE acct = $3 AND`+in+`),
+			'firstRound': coalesce(min(rnd) FILTER (WHERE prop = $3), 0),
+			'lastRound': coalesce(max(rnd) FILTER (WHERE prop = $3), 0),
+			'avgBlocksPerDay': CASE WHEN max(ts) > min(ts) THEN count(*) FILTER (WHERE prop = $3) * 86400 / (max(ts) - min(ts)) ELSE 0 END,
+			'range': {'firstRound': coalesce(min(rnd), 0), 'lastRound': coalesce(max(rnd), 0), 'firstTs': coalesce(min(ts), 0), 'lastTs': coalesce(max(ts), 0)}
+		})::VARCHAR FROM blocks WHERE rnd > 0 AND`+in)
+		ranged("GET /v0/payouts/highest", `SELECT coalesce(to_json(list({'proposer': prop, 'rnd': rnd, 'ts': ts, 'pp': pp} ORDER BY pp DESC, rnd))::VARCHAR, '[]')
+			FROM (SELECT prop, rnd, ts, pp FROM blocks WHERE prop IS NOT NULL AND`+in+` ORDER BY pp DESC, rnd LIMIT 10)`)
+		// Most recently evicted first.
+		ranged("GET /v0/evictions", `SELECT coalesce(to_json(list({'account': acct, 'evictions': n, 'rounds': rs} ORDER BY last DESC, acct))::VARCHAR, '[]')
+			FROM (SELECT acct, count(*) AS n, list(rnd ORDER BY rnd DESC) AS rs, max(rnd) AS last FROM evictions WHERE`+in+` GROUP BY acct)`)
+		ranged("GET /v0/evictions/{addr}", `SELECT coalesce(to_json(list(rnd ORDER BY rnd))::VARCHAR, '[]') FROM evictions WHERE acct = $3 AND`+in)
+		mux.HandleFunc("GET /v0/round/{rnd}", func(w http.ResponseWriter, r *http.Request) {
+			rnd, err := parseRound(r.PathValue("rnd"))
+			if err != nil {
+				http.Error(w, "rnd: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			replySQL(w, r, db, `SELECT (CASE WHEN pp > 0 THEN to_json({'proposer': prop, 'rnd': rnd, 'ts': ts, 'pp': pp})
+				ELSE to_json({'proposer': prop, 'rnd': rnd, 'ts': ts}) END)::VARCHAR FROM blocks WHERE rnd = $1::UINTEGER`, rnd)
+		})
+	}
+	if track.VoterRounds > 0 {
+		ranged("GET /v0/voters", `SELECT coalesce(to_json(list({'voter': voter, 'blocks': n} ORDER BY n DESC, voter))::VARCHAR, '[]')
+			FROM (SELECT voter, count(*) AS n FROM voters WHERE`+in+` GROUP BY voter)`)
+		ranged("GET /v0/voter/{addr}", `SELECT coalesce(to_json(list(rnd ORDER BY rnd))::VARCHAR, '[]') FROM voters WHERE voter = $3 AND`+in)
+	}
+	if track.Proposers || track.VoterRounds > 0 {
+		mux.HandleFunc("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
+			if a, ok := addr(w, r); ok {
+				replySQL(w, r, db, `SELECT to_json({'exists': EXISTS (SELECT 1 FROM blocks WHERE prop = $1)
+					OR EXISTS (SELECT 1 FROM voters WHERE voter = $1)})::VARCHAR`, a)
+			}
+		})
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")

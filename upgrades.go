@@ -52,7 +52,7 @@ func upgradeStep(ctx context.Context, db *sql.DB, src source, concurrency int, h
 	g.SetLimit(concurrency)
 	for i, r := range samples {
 		g.Go(func() error {
-			b, err := src.get(gctx, r, true)
+			b, err := src.get(gctx, r, true, false)
 			states[i] = b.UpgradeState
 			return err
 		})
@@ -75,7 +75,7 @@ func upgradeStep(ctx context.Context, db *sql.DB, src source, concurrency int, h
 			continue
 		}
 		u := &upgrade{Rnd: v - voteRounds, From: s.CurrentProtocol, Proto: s.NextProtocol, VoteBefore: v, SwitchOn: uint64(s.NextProtocolSwitchOn)}
-		b, err := src.get(ctx, u.Rnd, true)
+		b, err := src.get(ctx, u.Rnd, true, false)
 		if err != nil {
 			return 0, err
 		}
@@ -129,11 +129,11 @@ func upgradeStep(ctx context.Context, db *sql.DB, src source, concurrency int, h
 func settle(ctx context.Context, src source, u *upgrade, hi uint64) (bool, error) {
 	changed := false
 	if u.Passed == nil && u.VoteBefore <= hi {
-		last, err := src.get(ctx, u.VoteBefore-1, true) // approvals count in rounds < V
+		last, err := src.get(ctx, u.VoteBefore-1, true, false) // approvals count in rounds < V
 		if err != nil {
 			return false, err
 		}
-		at, err := src.get(ctx, u.VoteBefore, true) // cleared at V if rejected; switched if S == V
+		at, err := src.get(ctx, u.VoteBefore, true, false) // cleared at V if rejected; switched if S == V
 		if err != nil {
 			return false, err
 		}
@@ -141,7 +141,7 @@ func settle(ctx context.Context, src source, u *upgrade, hi uint64) (bool, error
 		u.Approvals, u.Passed, changed = &approvals, &passed, true
 	}
 	if u.Passed != nil && *u.Passed && u.SwitchTs == nil && u.SwitchOn <= hi {
-		b, err := src.get(ctx, u.SwitchOn, true)
+		b, err := src.get(ctx, u.SwitchOn, true, false)
 		if err != nil {
 			return false, err
 		}

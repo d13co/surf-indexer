@@ -1,6 +1,6 @@
 # Algorand Block Fees Service
 
-Stores the timestamp, txn counter and fees of every block of one network in DuckDB, ingested from an archival algod, and serves fee sums and block lookups.
+Stores the timestamp, txn counter and fees of every block of one network in DuckDB, ingested from an archival algod, and serves fee sums and block lookups. Optionally it also stores each block's proposer, payout and evicted (absent) accounts, and the cert voters of recent rounds, serving the [block-proposers](#proposers-and-voters) routes.
 
 API should be considered **unstable**.
 
@@ -15,7 +15,7 @@ ALGOD_HOST=http://localhost ALGOD_PORT=8080 ALGOD_TOKEN=... ./fees-api mainnet-v
 
 The first argument is the expected genesis ID (startup fails if algod reports another). An optional second argument names the DB: `data/<dbID>.duckdb`, default `data/<genesisID>.duckdb`.
 
-Ingestion starts at round 0 and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched.
+Ingestion starts at round 0 and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks.
 
 Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades:` errors repeat in the log every 10 minutes while fee ingest carries on.
 
@@ -26,19 +26,21 @@ Catching up from round 0 over REST is slow. On the archival node's machine, read
 ```
 # on the archival node, as the algod user: any -shm/-wal files SQLite creates must stay algod's
 find <algod datadir> -name ledger.block.sqlite
-LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0
+LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0 mainnet-v1.0-p
 ```
 
 This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
 
 ```
-rsync -P data/mainnet-v1.0.duckdb server:fees-api/data/mainnet-v1.0.duckdb.new
+rsync -P data/mainnet-v1.0-p.duckdb server:fees-api/data/mainnet-v1.0-p.duckdb.new
 # on the server
-rm -f data/mainnet-v1.0.duckdb.wal   # a stale WAL would be replayed onto the new file
-mv data/mainnet-v1.0.duckdb.new data/mainnet-v1.0.duckdb
+rm -f data/mainnet-v1.0-p.duckdb.wal   # a stale WAL would be replayed onto the new file
+mv data/mainnet-v1.0-p.duckdb.new data/mainnet-v1.0-p.duckdb
 ```
 
-Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival.
+Start the server as usual (`./fees-api mainnet-v1.0 mainnet-v1.0-p`); it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS` and `VOTER_ROUNDS`.
+
+With proposers on, rounds before the incentives upgrade read their whole cert from the ledger (~60 KB per round, ~2.8 TB over mainnet's first 46.5M rounds), so the import is I/O-bound.
 
 It is safe to run beside a live algod: the DB is opened read-only, and WAL readers don't block algod's writes. It does compete with algod for disk, page cache and CPU, so watch algod's lag (`goal node status`) and throttle with `CONCURRENCY`, or stop algod for the duration.
 
@@ -123,6 +125,66 @@ Every consensus upgrade proposal, oldest first.
 - `status`: `voting`, `rejected`, `approved` (waiting for `switchOn`) or `applied`
 - `switchTs`: timestamp of the `switchOn` block once applied, else `null`
 
+### Proposers and voters
+
+Ported from block-proposers, with time filters added. Proposer routes exist only with `PROPOSERS` on, voter routes only with `VOTER_ROUNDS` above 0, and `/v0/exists` with either; otherwise they 404.
+
+Every route below that takes `minRound`/`maxRound` also takes `start`/`end`, as in `/v0/fees`: rounds are inclusive, times are `[start, end)`, and all combine. Addresses must be valid (400 otherwise).
+
+`/v0/proposers`: proposers by blocks proposed, most first.
+
+```
+[{"proposer":"FNETJYY6YYB6SUWQDQZ5IDWLXOTOC2TMLW45B4O6MH5LREIBEXPREYSONY","blocks":22890,"payouts":0}, ...]
+```
+
+- `blocks`: number of blocks proposed
+- `payouts`: sum of proposer payouts in microAlgos
+
+`/v0/proposer/<address>`: the address's blocks, oldest first. `pp` (payout in microAlgos) is omitted when 0.
+
+```
+[{"rnd":13,"ts":1718000000},{"rnd":55577,"ts":1718200000,"pp":10000000}, ...]
+```
+
+`/v0/proposer/<address>/stats`: aggregate stats instead of the block list.
+
+```
+{"blocks":124,"payouts":1240000000,"suspensions":0,"firstRound":13,"lastRound":56546,"avgBlocksPerDay":3261.07,"range":{"firstRound":1,"lastRound":145286,"firstTs":1718000000,"lastTs":1782600000}}
+```
+
+- `blocks`, `payouts`: as in `/v0/proposers`
+- `suspensions`: number of times the account was evicted (suspended) in the range
+- `firstRound`, `lastRound`: the proposer's own first/last block in the range, 0 if none
+- `range`: the rounds and times queried, clipped to stored data (genesis excluded); `lastTs - firstTs` is its duration in seconds
+- `avgBlocksPerDay`: `blocks` divided by the range duration in days
+
+`/v0/payouts/highest`: the 10 highest payouts, `[{"proposer":"…","rnd":46600000,"ts":1737900000,"pp":8277679}, ...]`.
+
+`/v0/evictions`: accounts marked absent (`partupdabs`), most recently evicted first, each with its rounds newest first: `[{"account":"…","evictions":2,"rounds":[46700000,46650000]}, ...]`.
+
+`/v0/evictions/<address>`: the address's eviction rounds, oldest first: `[46650000,46700000]`.
+
+`/v0/round/<rnd>`: `{"proposer":"…","rnd":46600000,"ts":1737900000,"pp":8277679}`, `pp` omitted when 0, or 404 if the round isn't stored. Round 0 (genesis) has `"proposer":null`.
+
+`/v0/voters`: cert voters by blocks voted, most first: `[{"voter":"…","blocks":99000}, ...]`. Only the last `VOTER_ROUNDS` rounds are kept.
+
+`/v0/voter/<address>`: the rounds the address voted in, oldest first: `[65500001,65500002, ...]`.
+
+`/v0/exists/<address>`: `{"exists":true}` if the address proposed a stored block or voted in the window.
+
+#### Differences from block-proposers
+
+Clients switching from block-proposers should expect:
+
+1. `/v0/status`: `records` is `maxRound + 1`, as round 0 is stored; block-proposers started at round 1.
+2. `/v0/round/<rnd>` for a round not stored is a 404, not a 200 with an empty body. `/v0/round/0` returns genesis with `"proposer":null`.
+3. Stricter params return 400: `minRound`/`maxRound` must be integers in [0, 2³²) (floats and negatives were coerced), and addresses must pass the checksum (any 58 characters used to return empty results).
+4. No CORS preflight: only `Access-Control-Allow-Origin: *` is set, so a cross-origin request that needs a preflight gets 405. Plain `fetch` GETs are unaffected.
+5. Routes switched off by `PROPOSERS=0` or `VOTER_ROUNDS=0` return 404.
+6. Deployment: the DB file isn't compatible and must be rebuilt. `VOTE_ROUNDS_THRESHOLD` is now `VOTER_ROUNDS`, and the window is the last N rounds rather than N+1. `SYNC_THRESHOLD` and `EMIT_SPEED_EVERY` are gone, `DB_CHUNKS` means blocks per batch (default 1000), and `ALGOD_HOST`/`ALGOD_PORT` default to `http://localhost` and `8080`.
+
+Unchanged: paths, JSON keys, `pp` omitted when 0, the stats shape, eviction ordering and `exists`. Added: `start`/`end` on every ranged route, and explicit oldest-first order where block-proposers relied on insertion order.
+
 ## Environment Variables
 
 | name        | description                                                    | default_value    |
@@ -134,3 +196,9 @@ Every consensus upgrade proposal, oldest first.
 | CONCURRENCY | Concurrent block fetches (algod requests, or LEDGER_DB reads)  | 10               |
 | DB_CHUNKS   | Blocks per batch; each batch is fetched, then inserted at once | 1000             |
 | LEDGER_DB   | Path to an archival `ledger.block.sqlite`: bulk load and exit  |                  |
+| PROPOSERS   | Store each block's proposer, payout and evicted accounts       | true             |
+| VOTER_ROUNDS | Store cert voters of the last N rounds; 0 for none            | 100000           |
+
+`PROPOSERS` and `VOTER_ROUNDS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it.
+
+Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB.

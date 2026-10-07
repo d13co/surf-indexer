@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -43,7 +45,8 @@ func TestBlockFees(t *testing.T) {
 }
 
 // fakeAlgod serves *blocks (stamped with genesisID) and counts header-only requests.
-func fakeAlgod(t *testing.T, genesisID string, blocks *[]types.Block, headerOnly *atomic.Int32) *algod.Client {
+// A full fetch carries the cert, as algod's msgpack does.
+func fakeAlgod(t *testing.T, genesisID string, blocks *[]blockCert, headerOnly *atomic.Int32) *algod.Client {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v2/status/wait-for-block-after/") {
 			json.NewEncoder(w).Encode(models.NodeStatus{LastRound: uint64(len(*blocks) - 1)})
@@ -55,9 +58,10 @@ func fakeAlgod(t *testing.T, genesisID string, blocks *[]types.Block, headerOnly
 		b.GenesisID = genesisID
 		if r.URL.Query().Get("header-only") == "true" {
 			headerOnly.Add(1)
-			b.Payset = nil
+			w.Write(msgpack.Encode(models.BlockResponse{Block: types.Block{BlockHeader: b.BlockHeader}}))
+			return
 		}
-		w.Write(msgpack.Encode(models.BlockResponse{Block: b}))
+		w.Write(msgpack.Encode(b))
 	}))
 	t.Cleanup(srv.Close)
 	c, err := algod.MakeClient(srv.URL, "")
@@ -67,20 +71,55 @@ func fakeAlgod(t *testing.T, genesisID string, blocks *[]types.Block, headerOnly
 	return c
 }
 
-// mk builds round r with payset fees r*1000 + 1. With payouts on it has a proposer and
-// fc = r*7, so the stored fees show which path was taken.
-func mk(r int, payouts bool) types.Block {
-	var b types.Block
+// mk builds round r with payset fees r*1000 + 1 and, past genesis, a cert proposed by 'O' and voted
+// by 'V' and 'W'. With payouts on it has proposer 'P', fc = r*7 and pp = r*3, so the stored fees and
+// proposer show which path was taken. Rounds 2 and 7 mark 'E' absent.
+func mk(r int, payouts bool) blockCert {
+	var b blockCert
 	b.Round, b.TimeStamp, b.TxnCounter = types.Round(r), int64(1000+r), uint64(2*r)
 	b.FeeSink[0] = 'S'
 	b.Payset = []types.SignedTxnInBlock{{SignedTxnWithAD: stxn('A', uint64(r)*1000, stxn('B', 1))}}
+	if r > 0 {
+		b.Cert.Prop.OProp[0] = 'O'
+		for _, c := range "VW" {
+			var v struct {
+				Snd types.Address `codec:"snd"`
+			}
+			v.Snd[0] = byte(c)
+			b.Cert.Vote = append(b.Cert.Vote, v)
+		}
+	}
 	if payouts {
-		b.Proposer[0], b.FeesCollected = 'P', types.MicroAlgos(r*7)
+		b.Proposer[0], b.FeesCollected, b.ProposerPayout = 'P', types.MicroAlgos(r*7), types.MicroAlgos(r*3)
+	}
+	if r == 2 || r == 7 {
+		b.AbsentParticipationAccounts = []types.Address{{'E'}}
 	}
 	return b
 }
 
-// checkFees checks that rounds 0-10 hold mk's blocks, with payouts on for rounds 5-9.
+func addrOf(c byte) string { return types.Address{c}.String() }
+
+// strs returns q's rows, a single VARCHAR column each.
+func strs(t *testing.T, db *sql.DB, q string) []string {
+	rows, err := db.Query(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// checkFees checks that rounds 0-10 hold mk's blocks, with payouts on for rounds 5-9, and what
+// track asks for: proposers from the cert before payouts, from prp after, NULL at genesis.
 func checkFees(t *testing.T, db *sql.DB) {
 	for r := range 11 {
 		want := uint64(r*1000 + 1)
@@ -92,40 +131,132 @@ func checkFees(t *testing.T, db *sql.DB) {
 			t.Errorf("round %d = %+v %v, want fees %d", r, b, err, want)
 		}
 	}
+	var props, evictions []string
+	for r := range 11 {
+		prop, pp := "-", "-"
+		if track.Proposers {
+			switch prop, pp = addrOf('O'), "0"; {
+			case r == 0:
+				prop = "-"
+			case r >= 5 && r <= 9:
+				prop, pp = addrOf('P'), fmt.Sprint(r*3)
+			}
+		}
+		props = append(props, fmt.Sprintf("%d %s %s", r, prop, pp))
+	}
+	if track.Proposers {
+		evictions = []string{"2 " + addrOf('E'), "7 " + addrOf('E')}
+	}
+	got := strs(t, db, "SELECT rnd || ' ' || coalesce(prop, '-') || ' ' || coalesce(pp::VARCHAR, '-') FROM blocks ORDER BY rnd")
+	if !slices.Equal(got, props) {
+		t.Errorf("proposers = %q, want %q", got, props)
+	}
+	if got := strs(t, db, "SELECT rnd || ' ' || acct FROM evictions ORDER BY rnd"); len(got)+len(evictions) > 0 && !slices.Equal(got, evictions) {
+		t.Errorf("evictions = %q, want %q", got, evictions)
+	}
 }
 
 func TestSyncToTip(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	for _, track = range []config{{Proposers: true}, {}} {
+		t.Run(fmt.Sprint(track), func(t *testing.T) {
+			ctx := context.Background()
+			var blocks []blockCert
+			for r := range 10 {
+				blocks = append(blocks, mk(r, r >= 5))
+			}
+			var headerOnly atomic.Int32
+			good := fakeAlgod(t, "test-v1", &blocks, &headerOnly)
+			db, err := openDB("", "test-v1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			payouts.Store(false)
+			// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only.
+			if hi, err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5); err != nil || hi != 9 {
+				t.Fatal(hi, err)
+			}
+			if got := headerOnly.Load(); got != 4 {
+				t.Errorf("header-only fetches = %d, want 4", got)
+			}
+			// A header-only block without prp is refetched in full; an algod on another network is skipped.
+			blocks = append(blocks, mk(10, false))
+			other := make([]blockCert, len(blocks)) // zero fees: would show if used
+			wrong := fakeAlgod(t, "other-v1", &other, &headerOnly)
+			if hi, err := syncToTip(ctx, db, algodSource(algods{wrong, good}, "test-v1"), 1, 5); err != nil || hi != 10 {
+				t.Fatal(hi, err)
+			}
+			checkFees(t, db)
+			if got := strs(t, db, "SELECT voter FROM voters"); len(got) > 0 {
+				t.Errorf("voters = %q, want none", got)
+			}
+
+			// A cert that decodes to no proposer fails the sync rather than storing NULL.
+			blocks = append(blocks, mk(11, false))
+			blocks[11].Cert.Prop.OProp = types.Address{}
+			_, err = syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5)
+			if (err != nil) != track.Proposers {
+				t.Errorf("sync with no oprop: %v", err)
+			}
+		})
+	}
+}
+
+// TestVoterWindow checks that only the last VoterRounds rounds get voters, header-only outside it.
+func TestVoterWindow(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	track = config{VoterRounds: 3}
 	ctx := context.Background()
-	var blocks []types.Block
+	var blocks []blockCert
 	for r := range 10 {
 		blocks = append(blocks, mk(r, r >= 5))
 	}
 	var headerOnly atomic.Int32
-	good := fakeAlgod(t, "test-v1", &blocks, &headerOnly)
+	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1")
 	db, err := openDB("", "test-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	payouts.Store(false)
-	// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only.
-	if hi, err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5); err != nil || hi != 9 {
-		t.Fatal(hi, err)
+	voters := func(want ...int) {
+		t.Helper()
+		vw := []string{addrOf('V'), addrOf('W')}
+		slices.Sort(vw)
+		var w []string
+		for _, r := range want {
+			w = append(w, fmt.Sprintf("%d %s", r, vw[0]), fmt.Sprintf("%d %s", r, vw[1]))
+		}
+		if got := strs(t, db, "SELECT rnd || ' ' || voter FROM voters ORDER BY rnd, voter"); !slices.Equal(got, w) {
+			t.Errorf("voters = %q, want %q", got, w)
+		}
 	}
-	if got := headerOnly.Load(); got != 4 {
-		t.Errorf("header-only fetches = %d, want 4", got)
+	// 0-5 full, 6 header-only, 7-9 full for their certs.
+	if _, err := syncToTip(ctx, db, src, 1, 5); err != nil {
+		t.Fatal(err)
 	}
-	// A header-only block without prp is refetched in full; an algod on another network is skipped.
-	blocks = append(blocks, mk(10, false))
-	other := make([]types.Block, len(blocks)) // zero fees: would show if used
-	wrong := fakeAlgod(t, "other-v1", &other, &headerOnly)
-	if hi, err := syncToTip(ctx, db, algodSource(algods{wrong, good}, "test-v1"), 1, 5); err != nil || hi != 10 {
-		t.Fatal(hi, err)
+	if got := headerOnly.Load(); got != 1 {
+		t.Errorf("header-only fetches = %d, want 1", got)
 	}
-	checkFees(t, db)
+	voters(7, 8, 9)
+	blocks = append(blocks, mk(10, true), mk(11, true))
+	if _, err := syncToTip(ctx, db, src, 1, 5); err != nil {
+		t.Fatal(err)
+	}
+	voters(9, 10, 11)
+
+	// A cert in the window without votes fails the sync.
+	blocks = append(blocks, mk(12, true))
+	blocks[12].Cert.Vote = nil
+	if _, err := syncToTip(ctx, db, src, 1, 5); err == nil {
+		t.Error("sync with no votes should fail")
+	}
 }
 
 func TestLedgerSource(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	track = config{Proposers: true}
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "ledger.block.sqlite")
 	w, err := sql.Open("sqlite3", path)
@@ -139,11 +270,15 @@ func TestLedgerSource(t *testing.T) {
 	for r := range 11 {
 		b := mk(r, r >= 5 && r <= 9)
 		b.GenesisID = "test-v1"
-		blk := msgpack.Encode(&b)
+		blk := msgpack.Encode(&b.Block)
 		if r >= 6 && r <= 9 {
 			blk = nil // must be read header-only: a full fetch fails to decode
 		}
-		if _, err := w.Exec("INSERT INTO blocks VALUES (?, '', ?, ?, NULL)", r, msgpack.Encode(&b.BlockHeader), blk); err != nil {
+		var cert []byte // a bare agreement.Certificate, where the proposer comes from before payouts
+		if r > 0 && (r < 5 || r == 10) {
+			cert = msgpack.Encode(&b.Cert)
+		}
+		if _, err := w.Exec("INSERT INTO blocks VALUES (?, '', ?, ?, ?)", r, msgpack.Encode(&b.BlockHeader), blk, cert); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -197,6 +332,8 @@ func TestOpenDBGenesis(t *testing.T) {
 	}
 }
 
+func blk(rnd, ts, tc, fees uint64) block { return block{Rnd: rnd, Ts: ts, Tc: tc, Fees: fees} }
+
 func TestQueries(t *testing.T) {
 	ctx := context.Background()
 	db, err := openDB("", "test-v1")
@@ -209,12 +346,12 @@ func TestQueries(t *testing.T) {
 		t.Fatalf("empty rounds = %d %d %d %v", n, lo, hi, err)
 	}
 	rows := []block{
-		{0, 100, 1000, 0}, // genesis counter starts at 1000
-		{1, 110, 1000, 0}, // empty block, repeated ts
-		{2, 110, 1003, 3000},
-		{3, 110, 1005, 2500},
-		{4, 120, 1005, 0},
-		{5, 125, 1010, 7000},
+		blk(0, 100, 1000, 0), // genesis counter starts at 1000
+		blk(1, 110, 1000, 0), // empty block, repeated ts
+		blk(2, 110, 1003, 3000),
+		blk(3, 110, 1005, 2500),
+		blk(4, 120, 1005, 0),
+		blk(5, 125, 1010, 7000),
 	}
 	if err := insertBatch(ctx, db, rows); err != nil {
 		t.Fatal(err)
@@ -281,8 +418,8 @@ func TestSeries(t *testing.T) {
 	defer db.Close()
 	// Genesis at ts 0 as on private nets, then blocks from Monday 2025-10-06 (m); hour m+2h is empty.
 	const m = 1759708800
-	if err := insertBatch(ctx, db, []block{{0, 0, 1000, 0}, {1, m + 3599, 1004, 100}, {2, m + 3600, 1010, 200},
-		{3, m + 3*3600, 1011, 300}, {4, m + 4*3600, 1013, 400}}); err != nil {
+	if err := insertBatch(ctx, db, []block{blk(0, 0, 1000, 0), blk(1, m+3599, 1004, 100), blk(2, m+3600, 1010, 200),
+		blk(3, m+3*3600, 1011, 300), blk(4, m+4*3600, 1013, 400)}); err != nil {
 		t.Fatal(err)
 	}
 	h := func(ts int64, fees, txns, blocks uint64) bucket {
@@ -327,7 +464,7 @@ func TestSyncUpgrades(t *testing.T) {
 	// 15001 and gets 9500 by V=25001: approved, switching at S=45001.
 	var calls atomic.Int32
 	var fail uint64 // a round whose fetch fails, if non-zero
-	src := source{get: func(_ context.Context, rnd uint64, _ bool) (b types.Block, _ error) {
+	src := source{get: func(_ context.Context, rnd uint64, _, _ bool) (b blockCert, _ error) {
 		calls.Add(1)
 		if fail != 0 && rnd == fail {
 			return b, fmt.Errorf("round %d unavailable", rnd)
@@ -387,6 +524,166 @@ func TestSyncUpgrades(t *testing.T) {
 			if (err != nil) != (s.fail != 0) || qerr != nil || calls.Load() != s.calls || string(got) != s.want {
 				t.Errorf("hi=%d: %s %v %v, %d calls; want %s, %d calls", s.hi, got, err, qerr, calls.Load(), s.want, s.calls)
 			}
+		}
+	}
+}
+
+func TestOpenDBConfig(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	ctx := context.Background()
+	dir := t.TempDir()
+	open := func(path string, c config) error {
+		t.Helper()
+		track = c
+		db, err := openDB(path, "test-v1")
+		if err == nil {
+			var got config
+			if err := db.QueryRow("SELECT * FROM config").Scan(&got.Proposers, &got.VoterRounds); err != nil || got != c {
+				t.Errorf("stored config = %+v %v, want %+v", got, err, c)
+			}
+			if err := insertBatch(ctx, db, []block{blk(0, 0, 0, 0)}); err != nil {
+				t.Error(err)
+			}
+			db.Close()
+		}
+		return err
+	}
+	// refused fails if path opens under c, or its bytes change.
+	refused := func(path string, c config) {
+		t.Helper()
+		before, _ := os.ReadFile(path)
+		if err := open(path, c); err == nil {
+			t.Errorf("%+v: want refused", c)
+		}
+		if after, _ := os.ReadFile(path); !bytes.Equal(before, after) {
+			t.Errorf("%+v: refusal changed the file", c)
+		}
+	}
+
+	// An empty DB may change config; open inserts a block, which fixes it.
+	path := filepath.Join(dir, "new.duckdb")
+	track = config{Proposers: true, VoterRounds: 5}
+	db, err := openDB(path, "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if err := open(path, config{VoterRounds: 3}); err != nil {
+		t.Fatal(err)
+	}
+	refused(path, config{Proposers: true, VoterRounds: 3})
+	refused(path, config{})
+
+	// A fees-only DB from before config, holding a block.
+	legacy := filepath.Join(dir, "legacy.duckdb")
+	if db, err = sql.Open("duckdb", legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE blocks(rnd UINTEGER NOT NULL, ts UINTEGER NOT NULL, tc UBIGINT NOT NULL, fees UBIGINT NOT NULL);
+		CREATE TABLE meta(genesis VARCHAR NOT NULL); INSERT INTO meta VALUES ('test-v1'); INSERT INTO blocks VALUES (0, 0, 0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	refused(legacy, config{Proposers: true})
+	refused(legacy, config{VoterRounds: 1})
+	if err := open(legacy, config{}); err != nil {
+		t.Fatal(err)
+	}
+	if db, err = sql.Open("duckdb", legacy); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := strs(t, db, "SELECT coalesce(prop, '-') || coalesce(pp::VARCHAR, '-') FROM blocks"); !slices.Equal(got, []string{"--", "--"}) {
+		t.Errorf("legacy rows = %q", got)
+	}
+}
+
+func TestProposerRoutes(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	track = config{Proposers: true, VoterRounds: 100}
+	ctx := context.Background()
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	A, B, C, D := addrOf(1), addrOf(2), addrOf(3), addrOf(4) // in string order
+	const d = 1759708800                                     // 2025-10-06
+	at := func(rnd, ts uint64, prop string, pp uint64, absent, voters []string) block {
+		b := blk(rnd, ts, 0, 0)
+		b.prop, b.pp, b.absent, b.voters = prop, pp, absent, voters
+		return b
+	}
+	if err := insertBatch(ctx, db, []block{
+		at(0, 100, "", 0, nil, nil),
+		at(1, d+10, A, 0, nil, []string{A, B}),
+		at(2, d+20, B, 5, []string{C}, []string{A}),
+		at(3, d+86400, A, 7, nil, []string{B}),
+		at(4, d+86430, A, 0, []string{C, A}, nil),
+		at(5, d+2*86400+10, C, 9, nil, []string{A, B, C}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := routes(db)
+	get := func(url string) (int, string) {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", url, nil))
+		return w.Code, strings.TrimSpace(w.Body.String())
+	}
+	r := strings.NewReplacer("@A", A, "@B", B, "@C", C, "@D", D)
+	ok := http.StatusOK
+	for _, c := range []struct {
+		url  string
+		code int
+		want string // @A-@D are replaced with the addresses
+	}{
+		{"/v0/proposers", ok, `[{"proposer":"@A","blocks":3,"payouts":7},{"proposer":"@B","blocks":1,"payouts":5},{"proposer":"@C","blocks":1,"payouts":9}]`},
+		{"/v0/proposers?minRound=2&maxRound=4", ok, `[{"proposer":"@A","blocks":2,"payouts":7},{"proposer":"@B","blocks":1,"payouts":5}]`},
+		{"/v0/proposers?start=2025-10-07", ok, `[{"proposer":"@A","blocks":2,"payouts":7},{"proposer":"@C","blocks":1,"payouts":9}]`},
+		{fmt.Sprintf("/v0/proposers?start=%d&end=%d", d+15, d+86400), ok, `[{"proposer":"@B","blocks":1,"payouts":5}]`},
+		{"/v0/proposers?minRound=4&start=2025-10-07&end=2025-10-08", ok, `[{"proposer":"@A","blocks":1,"payouts":0}]`},
+		{fmt.Sprintf("/v0/proposers?start=%d&end=%d", d+21, d+86400), ok, `[]`}, // between rounds 2 and 3
+		{"/v0/proposers?end=50", ok, `[]`},
+		{"/v0/proposers?start=yesterday", 400, ""},
+		{"/v0/proposers?minRound=-1", 400, ""},
+		{"/v0/proposer/@A", ok, fmt.Sprintf(`[{"rnd":1,"ts":%d},{"rnd":3,"ts":%d,"pp":7},{"rnd":4,"ts":%d}]`, d+10, d+86400, d+86430)},
+		{"/v0/proposer/@A?maxRound=3&start=2025-10-07", ok, fmt.Sprintf(`[{"rnd":3,"ts":%d,"pp":7}]`, d+86400)},
+		{"/v0/proposer/@D", ok, `[]`},
+		{"/v0/proposer/nope", 400, ""},
+		{"/v0/proposer/@A/stats", ok, fmt.Sprintf(`{"blocks":3,"payouts":7,"suspensions":1,"firstRound":1,"lastRound":4,"avgBlocksPerDay":1.5,"range":{"firstRound":1,"lastRound":5,"firstTs":%d,"lastTs":%d}}`, d+10, d+2*86400+10)},
+		{"/v0/proposer/@A/stats?start=2025-10-07&maxRound=4", ok, fmt.Sprintf(`{"blocks":2,"payouts":7,"suspensions":1,"firstRound":3,"lastRound":4,"avgBlocksPerDay":5760.0,"range":{"firstRound":3,"lastRound":4,"firstTs":%d,"lastTs":%d}}`, d+86400, d+86430)},
+		{"/v0/proposer/@D/stats?minRound=9", ok, `{"blocks":0,"payouts":0,"suspensions":0,"firstRound":0,"lastRound":0,"avgBlocksPerDay":0.0,"range":{"firstRound":0,"lastRound":0,"firstTs":0,"lastTs":0}}`},
+		{"/v0/payouts/highest", ok, fmt.Sprintf(`[{"proposer":"@C","rnd":5,"ts":%d,"pp":9},{"proposer":"@A","rnd":3,"ts":%d,"pp":7},{"proposer":"@B","rnd":2,"ts":%d,"pp":5},{"proposer":"@A","rnd":1,"ts":%d,"pp":0},{"proposer":"@A","rnd":4,"ts":%d,"pp":0}]`, d+2*86400+10, d+86400, d+20, d+10, d+86430)},
+		{"/v0/evictions", ok, `[{"account":"@A","evictions":1,"rounds":[4]},{"account":"@C","evictions":2,"rounds":[4,2]}]`},
+		{"/v0/evictions?maxRound=3", ok, `[{"account":"@C","evictions":1,"rounds":[2]}]`},
+		{"/v0/evictions?minRound=5", ok, `[]`},
+		{"/v0/evictions/@C", ok, `[2,4]`},
+		{"/v0/evictions/@C?end=2025-10-07", ok, `[2]`},
+		{"/v0/round/3", ok, fmt.Sprintf(`{"proposer":"@A","rnd":3,"ts":%d,"pp":7}`, d+86400)},
+		{"/v0/round/1", ok, fmt.Sprintf(`{"proposer":"@A","rnd":1,"ts":%d}`, d+10)},
+		{"/v0/round/0", ok, `{"proposer":null,"rnd":0,"ts":100}`},
+		{"/v0/round/99", 404, ""},
+		{"/v0/round/x", 400, ""},
+		{"/v0/voters", ok, `[{"voter":"@A","blocks":3},{"voter":"@B","blocks":3},{"voter":"@C","blocks":1}]`},
+		{"/v0/voters?start=2025-10-07", ok, `[{"voter":"@B","blocks":2},{"voter":"@A","blocks":1},{"voter":"@C","blocks":1}]`},
+		{"/v0/voter/@B", ok, `[1,3,5]`},
+		{"/v0/voter/@B?end=2025-10-08", ok, `[1,3]`},
+		{"/v0/voter/@D", ok, `[]`},
+		{"/v0/exists/@C", ok, `{"exists":true}`},
+		{"/v0/exists/@D", ok, `{"exists":false}`},
+		{"/v0/exists/nope", 400, ""},
+	} {
+		code, body := get(r.Replace(c.url))
+		if code != c.code || (c.code == ok && body != r.Replace(c.want)) {
+			t.Errorf("%s = %d %s, want %d %s", c.url, code, body, c.code, c.want)
+		}
+	}
+
+	track = config{}
+	h = routes(db)
+	for _, url := range []string{"/v0/proposers", "/v0/round/1", "/v0/voters", "/v0/exists/" + A} {
+		if code, _ := get(url); code != 404 {
+			t.Errorf("%s with tracking off = %d, want 404", url, code)
 		}
 	}
 }
