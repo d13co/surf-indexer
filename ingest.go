@@ -123,11 +123,13 @@ func algodSource(a algods, genesisID string) source {
 }
 
 // fetchBlock fetches round rnd with what track asks for, and its cert voters if voters is set.
-// Header only once payouts are on, unless the cert is needed.
+// Header only once payouts are on, unless the cert or (fullBlocks) the payset is needed. The cert is
+// read only for its proposer before payouts, or for voters: a ledger rebuild would otherwise read
+// every post-payout cert.
 func fetchBlock(ctx context.Context, src source, rnd uint64, voters bool) (block, error) {
-	headerOnly := payouts.Load()
-	b, err := src.get(ctx, rnd, headerOnly, voters || track.Proposers && !headerOnly)
-	if err == nil && headerOnly && b.Proposer.IsZero() {
+	p := payouts.Load()
+	b, err := src.get(ctx, rnd, p && !track.fullBlocks(), voters || track.Proposers && !p)
+	if err == nil && p && b.Proposer.IsZero() {
 		// not expected once payouts are on; recompute from the payset
 		b, err = src.get(ctx, rnd, false, voters || track.Proposers)
 	}
@@ -164,6 +166,9 @@ func fetchBlock(ctx context.Context, src source, rnd uint64, voters bool) (block
 			blk.voters = append(blk.voters, v.Snd.String())
 		}
 	}
+	if track.Lsigs {
+		blk.lsigs = lsigUses(b.Block)
+	}
 	return blk, nil
 }
 
@@ -193,7 +198,7 @@ func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chu
 	if err != nil {
 		return 0, err
 	}
-	next := uint64(hi + 1)
+	next := max(uint64(hi+1), startRound)
 	tip, err := src.tip(ctx, next)
 	if err != nil {
 		return 0, err
@@ -216,12 +221,12 @@ func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chu
 		if err := insertBatch(ctx, db, rows); err != nil {
 			return 0, err
 		}
-		attrs := []any{"from", next, "to", end, "blocks", len(rows), "headerOnly", payouts.Load()}
+		attrs := []any{"from", next, "to", end, "blocks", len(rows), "headerOnly", payouts.Load() && !track.fullBlocks()}
 		if next != tip { // at tip one block arrives per long-poll, so a rate would only be fetch+insert latency
 			attrs = append(attrs, "blkPerSec", math.Round(float64(len(rows))/time.Since(start).Seconds()))
 		}
 		slog.Info("inserted", attrs...)
 		next = end + 1
 	}
-	return next - 1, nil
+	return min(next-1, tip), nil // a START_ROUND past the tip stored nothing yet
 }

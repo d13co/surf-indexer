@@ -95,7 +95,10 @@ func algodClients(concurrency int) (algods, error) {
 	return a, nil
 }
 
-// openData opens data/<dbID>.duckdb, refusing one that isn't contiguous from round 0.
+// startRound is where ingest into an empty DB begins: 0 but for trials (START_ROUND), whose DB is partial.
+var startRound uint64
+
+// openData opens data/<dbID>.duckdb, refusing one that isn't contiguous from startRound.
 func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 	if err := os.MkdirAll("data", 0o755); err != nil {
 		fatal("data dir", "err", err)
@@ -105,9 +108,9 @@ func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 	if err != nil {
 		fatal("open db", "err", err)
 	}
-	if n, lo, hi, err := rounds(ctx, db); err != nil || lo != 0 || hi+1 != n {
+	if n, lo, hi, err := rounds(ctx, db); err != nil || n > 0 && (lo != int64(startRound) || hi+1-lo != n) {
 		db.Close()
-		fatal("db not contiguous from round 0", "records", n, "minRound", lo, "maxRound", hi, "err", err)
+		fatal("db not contiguous from START_ROUND", "startRound", startRound, "records", n, "minRound", lo, "maxRound", hi, "err", err)
 	}
 	return db
 }
@@ -148,14 +151,17 @@ func main() {
 	if voterRounds > math.MaxUint32 {
 		fatal("VOTER_ROUNDS: expected < 2^32", "got", voterRounds)
 	}
-	track = config{Proposers: envBool("PROPOSERS", true), VoterRounds: uint64(voterRounds)}
+	track = config{Proposers: envBool("PROPOSERS", true), VoterRounds: uint64(voterRounds), Lsigs: envBool("LSIGS", false)}
+	if startRound = uint64(envInt("START_ROUND", 0, 0)); startRound > math.MaxUint32 {
+		fatal("START_ROUND: expected < 2^32", "got", startRound)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	concurrency, chunk, ledger, port := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1), os.Getenv("LEDGER_DB"), envStr("PORT", "8118")
 	slog.Info("config", "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", ledger, "port", port,
-		"proposers", track.Proposers, "voterRounds", track.VoterRounds)
+		"proposers", track.Proposers, "voterRounds", track.VoterRounds, "lsigs", track.Lsigs, "startRound", startRound)
 	if ledger != "" {
 		importLedger(ctx, ledger, genesisID, dbID, concurrency, chunk)
 		return

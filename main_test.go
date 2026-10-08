@@ -22,6 +22,7 @@ import (
 
 	"github.com/algorand/go-algorand-sdk/v2/client/v2/algod"
 	"github.com/algorand/go-algorand-sdk/v2/client/v2/common/models"
+	"github.com/algorand/go-algorand-sdk/v2/crypto"
 	"github.com/algorand/go-algorand-sdk/v2/encoding/msgpack"
 	"github.com/algorand/go-algorand-sdk/v2/types"
 )
@@ -76,12 +77,19 @@ func fakeAlgod(t *testing.T, genesisID string, blocks *[]blockCert, headerOnly *
 
 // mk builds round r with payset fees r*1000 + 1 and, past genesis, a cert proposed by 'O' and voted
 // by 'V' and 'W'. With payouts on it has proposer 'P', fc = r*7 and pp = r*3, so the stored fees and
-// proposer show which path was taken. Rounds 2 and 7 mark 'E' absent.
+// proposer show which path was taken. Rounds 2 and 7 mark 'E' absent. From round 5, an escrow lsig
+// (mkLsig) sends a fee 0 txn, so either fee path is unchanged.
 func mk(r int, payouts bool) blockCert {
 	var b blockCert
 	b.Round, b.TimeStamp, b.TxnCounter = types.Round(r), int64(1000+r), uint64(2*r)
 	b.FeeSink[0] = 'S'
 	b.Payset = []types.SignedTxnInBlock{{SignedTxnWithAD: stxn('A', uint64(r)*1000, stxn('B', 1))}}
+	if r >= 5 {
+		var l types.SignedTxnInBlock
+		l.Lsig = mkLsig(r)
+		l.Txn.Sender = crypto.LogicSigAddress(l.Lsig)
+		b.Payset = append(b.Payset, l)
+	}
 	if r > 0 {
 		b.Cert.Prop.OProp[0] = 'O'
 		for _, c := range "VW" {
@@ -100,6 +108,9 @@ func mk(r int, payouts bool) blockCert {
 	}
 	return b
 }
+
+// mkLsig is round r's escrow: pushint r, so every round's is another instance of one template.
+func mkLsig(r int) types.LogicSig { return types.LogicSig{Logic: []byte{6, 0x81, byte(r)}} }
 
 func addrOf(c byte) string { return types.Address{c}.String() }
 
@@ -161,13 +172,27 @@ func checkFees(t *testing.T, db *sql.DB) {
 	if got := strs(t, db, "SELECT rnd || ' ' || txns FROM blocks WHERE txns > 0"); !slices.Equal(got, []string{"0 1"}) {
 		t.Errorf("txns = %q, want round 0's 1", got)
 	}
+	if !track.Lsigs {
+		return
+	}
+	var lsigs []string
+	for r := 5; r <= 10; r++ {
+		lsigs = append(lsigs, fmt.Sprintf("%s 1 %d %d", crypto.LogicSigAddress(mkLsig(r)), r, r))
+	}
+	slices.Sort(lsigs)
+	if got := strs(t, db, "SELECT prog || ' ' || txns || ' ' || first_rnd || ' ' || last_rnd FROM lsigs WHERE signer = '' AND sender = '' ORDER BY prog"); !slices.Equal(got, lsigs) {
+		t.Errorf("lsigs = %q, want %q", got, lsigs)
+	}
+	if got := strs(t, db, "SELECT count(DISTINCT tmpl) || ' ' || (SELECT count(*) FROM lsig_templates) FROM lsigs"); !slices.Equal(got, []string{"1 1"}) {
+		t.Errorf("templates, samples = %q, want 1 1", got)
+	}
 }
 
 func TestSyncToTip(t *testing.T) {
 	defer func(d time.Duration) { retryWait = d }(retryWait)
 	retryWait = 0 // the cert guards fail after call's retries
 	defer func(c config) { track = c }(track)
-	for _, track = range []config{{Proposers: true}, {}} {
+	for _, track = range []config{{Proposers: true}, {}, {Proposers: true, Lsigs: true}} {
 		t.Run(fmt.Sprint(track), func(t *testing.T) {
 			ctx := context.Background()
 			var blocks []blockCert
@@ -182,12 +207,17 @@ func TestSyncToTip(t *testing.T) {
 			}
 			defer db.Close()
 			payouts.Store(false)
-			// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only.
+			// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only
+			// unless lsigs need every payset.
 			if hi, err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5); err != nil || hi != 9 {
 				t.Fatal(hi, err)
 			}
-			if got := headerOnly.Load(); got != 4 {
-				t.Errorf("header-only fetches = %d, want 4", got)
+			want := int32(4)
+			if track.Lsigs {
+				want = 0
+			}
+			if got := headerOnly.Load(); got != want {
+				t.Errorf("header-only fetches = %d, want %d", got, want)
 			}
 			// A header-only block without prp is refetched in full; an algod on another network, or one
 			// whose blocks lack the cert (as from a stripping proxy), is skipped.
@@ -273,7 +303,12 @@ func TestVoterWindow(t *testing.T) {
 
 func TestLedgerSource(t *testing.T) {
 	defer func(c config) { track = c }(track)
-	track = config{Proposers: true}
+	for _, track = range []config{{Proposers: true}, {Proposers: true, Lsigs: true}} {
+		t.Run(fmt.Sprint(track), testLedgerSource)
+	}
+}
+
+func testLedgerSource(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "ledger.block.sqlite")
 	w, err := sql.Open("sqlite3", path)
@@ -288,12 +323,15 @@ func TestLedgerSource(t *testing.T) {
 		b := mk(r, r >= 5 && r <= 9)
 		b.GenesisID = "test-v1"
 		blk := msgpack.Encode(&b.Block)
-		if r >= 6 && r <= 9 {
+		if r >= 6 && r <= 9 && !track.Lsigs {
 			blk = nil // must be read header-only: a full fetch fails to decode
 		}
 		var cert []byte // a bare agreement.Certificate, where the proposer comes from before payouts
 		if r > 0 && (r < 5 || r == 10) {
 			cert = msgpack.Encode(&b.Cert)
+		}
+		if r >= 6 && r <= 9 {
+			cert = []byte{0xc1} // undecodable: payouts are on, so reading it fails the sync
 		}
 		if _, err := w.Exec("INSERT INTO blocks VALUES (?, '', ?, ?, ?)", r, msgpack.Encode(&b.BlockHeader), blk, cert); err != nil {
 			t.Fatal(err)
@@ -312,7 +350,8 @@ func TestLedgerSource(t *testing.T) {
 	}
 	defer db.Close()
 	payouts.Store(false)
-	// Same path as TestSyncToTip: 0-5 full (5 flips payouts), 6-9 header-only, 10 refetched in full.
+	// Same path as TestSyncToTip: 0-5 full (5 flips payouts), 6-9 header-only (full with lsigs, never
+	// with their certs), 10 refetched in full.
 	if _, err := syncToTip(ctx, db, src, 1, 5); err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +651,8 @@ func TestOpenDBConfig(t *testing.T) {
 		db, err := openDB(path, "test-v1")
 		if err == nil {
 			var got config
-			if err := db.QueryRow("SELECT * FROM config").Scan(&got.Proposers, &got.VoterRounds); err != nil || got != c {
+			err := db.QueryRow("SELECT *, (SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'lsigs') FROM config").Scan(&got.Proposers, &got.VoterRounds, &got.Lsigs)
+			if err != nil || got != c {
 				t.Errorf("stored config = %+v %v, want %+v", got, err, c)
 			}
 			if err := insertBatch(ctx, db, []block{row(0, 0, 0, 0)}); err != nil {
@@ -647,6 +687,24 @@ func TestOpenDBConfig(t *testing.T) {
 	}
 	refused(path, config{Proposers: true, VoterRounds: 3})
 	refused(path, config{})
+	refused(path, config{VoterRounds: 3, Lsigs: true})
+
+	// Lsigs, stored as the lsigs table's presence, toggles while empty and is then fixed both ways.
+	lpath := filepath.Join(dir, "lsigs.duckdb")
+	track = config{Lsigs: true}
+	if db, err = openDB(lpath, "test-v1"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if err := open(lpath, config{}); err != nil {
+		t.Fatal(err)
+	}
+	refused(lpath, config{Lsigs: true})
+	lpath = filepath.Join(dir, "lsigs2.duckdb")
+	if err := open(lpath, config{Lsigs: true}); err != nil {
+		t.Fatal(err)
+	}
+	refused(lpath, config{})
 
 	// A fees-only DB from before config, holding a block.
 	legacy := filepath.Join(dir, "legacy.duckdb")
@@ -758,6 +816,157 @@ func TestProposerRoutes(t *testing.T) {
 	for _, url := range []string{"/v0/proposers", "/v0/round/1", "/v0/voters", "/v0/exists/" + A} {
 		if code, _ := get(url); code != 404 {
 			t.Errorf("%s with tracking off = %d, want 404", url, code)
+		}
+	}
+}
+
+func TestMergeLsigs(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	track = config{Lsigs: true}
+	ctx := context.Background()
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	at := func(rnd uint64, uses ...lsigUse) block { b := row(rnd, rnd, 0, 0); b.lsigs = uses; return b }
+	U := lsigUse{prog: "P", tmpl: "t1", logic: "AQ==", n: 2}
+	V := lsigUse{prog: "Q", signer: "Y", tmpl: "t1", logic: "Ag==", n: 1}
+	U1 := U
+	U1.n, U1.logic = 1, "Aw=="
+	W := lsigUse{prog: "W", tmpl: "t2", n: 1} // used twice in one batch only
+	for _, batch := range [][]block{{at(5, U, V, W), at(6), at(7, U1, W)}, {at(9, U1)}, {at(10)}} {
+		if err := insertBatch(ctx, db, batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"P - - 4 5 9", "Q Y - 1 5 5", "W - - 2 5 7"}
+	if got := strs(t, db, `SELECT concat_ws(' ', prog, coalesce(nullif(signer, ''), '-'), coalesce(nullif(sender, ''), '-'), txns, first_rnd, last_rnd)
+		FROM lsigs ORDER BY prog`); !slices.Equal(got, want) {
+		t.Errorf("lsigs = %q, want %q", got, want)
+	}
+	if got := strs(t, db, "SELECT tmpl || ' ' || logic FROM lsig_templates"); !slices.Equal(got, []string{"t1 AQ=="}) {
+		t.Errorf("lsig_templates = %q, want the first logic", got)
+	}
+}
+
+// TestStartRound checks that an empty DB starts at startRound, and a later sync resumes past it.
+func TestStartRound(t *testing.T) {
+	defer func(c config, r uint64) { track, startRound = c, r }(track, startRound)
+	track, startRound = config{}, 7
+	ctx := context.Background()
+	var blocks []blockCert
+	for r := range 10 {
+		blocks = append(blocks, mk(r, false))
+	}
+	var headerOnly atomic.Int32
+	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1")
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	payouts.Store(false)
+	for _, hi := range []int64{9, 10} {
+		if hi == 10 {
+			blocks = append(blocks, mk(10, false))
+		}
+		if _, err := syncToTip(ctx, db, src, 1, 5); err != nil {
+			t.Fatal(err)
+		}
+		if n, lo, got, err := rounds(ctx, db); err != nil || n != hi-6 || lo != 7 || got != hi {
+			t.Errorf("rounds = %d %d %d %v, want %d 7 %d", n, lo, got, err, hi-6, hi)
+		}
+	}
+	// Past the tip, it stores nothing (fetching would panic) and returns the tip, not START_ROUND-1.
+	startRound = 20
+	edb, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer edb.Close()
+	tip10 := source{tip: func(context.Context, uint64) (uint64, error) { return 10, nil }}
+	if hi, err := syncToTip(ctx, edb, tip10, 1, 5); err != nil || hi != 10 {
+		t.Errorf("syncToTip past the tip = %d %v, want 10", hi, err)
+	}
+}
+
+func TestLsigRoutes(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	track = config{Lsigs: true}
+	ctx := context.Background()
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	A, B, C, D, E, F, G, H := addrOf(1), addrOf(2), addrOf(3), addrOf(4), addrOf(5), addrOf(6), addrOf(7), addrOf(8)
+	const t1, t2, t3 = "00000000000000a1", "00000000000000a2", "00000000000000a3"
+	at := func(rnd uint64, uses ...lsigUse) block { b := row(rnd, rnd, 0, 0); b.lsigs = uses; return b }
+	// A and B are escrows of template t1; D delegated C (t2), also sending for E rekeyed to D; G and H
+	// delegated F (t3).
+	if err := insertBatch(ctx, db, []block{
+		at(1, lsigUse{A, "", "", t1, "AQ==", 1}),
+		at(2, lsigUse{B, "", "", t1, "", 2}, lsigUse{C, D, "", t2, "Ag==", 1}),
+		at(3, lsigUse{C, D, E, t2, "", 1}),
+		at(4, lsigUse{F, G, "", t3, "Aw==", 1}, lsigUse{F, H, "", t3, "", 1}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	use := func(prog, tmpl, signer, sender string, txns, first, last int) string {
+		q := func(s string) string {
+			if s == "" {
+				return "null"
+			}
+			return `"` + s + `"`
+		}
+		return fmt.Sprintf(`{"lsig":"%s","template":"%s","signer":%s,"sender":%s,"txns":%d,"firstRound":%d,"lastRound":%d}`,
+			prog, tmpl, q(signer), q(sender), txns, first, last)
+	}
+	uA, uB, uC, uCE := use(A, t1, "", "", 1, 1, 1), use(B, t1, "", "", 2, 2, 2), use(C, t2, D, "", 1, 2, 2), use(C, t2, D, E, 1, 3, 3)
+	h := routes(db)
+	get := func(url string) (int, string) {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", url, nil))
+		return w.Code, strings.TrimSpace(w.Body.String())
+	}
+	ok := http.StatusOK
+	for _, c := range []struct {
+		url  string
+		code int
+		want string
+	}{
+		{"/v0/lsig/" + A, ok, `{"template":"` + t1 + `","programs":2,"uses":[` + uA + `]}`},
+		{"/v0/lsig/" + C, ok, `{"template":"` + t2 + `","programs":1,"uses":[` + uCE + "," + uC + `]}`},
+		{"/v0/lsig/" + C + "?limit=1", ok, `{"template":"` + t2 + `","programs":1,"uses":[` + uCE + `]}`},
+		{"/v0/lsig/" + D, 404, ""}, // a delegator, not a program
+		{"/v0/lsig/nope", 400, ""},
+		{"/v0/lsig/" + A + "?limit=0", 400, ""},
+		{"/v0/delegations/" + D, ok, "[" + uCE + "," + uC + "]"},
+		{"/v0/delegations/" + E, ok, "[" + uCE + "]"},
+		{"/v0/delegations/" + A, ok, "[]"},
+		// t2 is one program with one delegator: not listed.
+		{"/v0/templates", ok, `[{"template":"` + t1 + `","programs":2,"delegators":0,"txns":3,"firstRound":1,"lastRound":2},` +
+			`{"template":"` + t3 + `","programs":1,"delegators":2,"txns":2,"firstRound":4,"lastRound":4}]`},
+		{"/v0/templates?limit=x", 400, ""},
+		{"/v0/templates?limit=100001", 400, ""},
+		{"/v0/template/" + t1, ok, `{"template":"` + t1 + `","logic":"AQ==","programs":2,"uses":[` + uB + "," + uA + `]}`},
+		{"/v0/template/" + t2 + "?limit=1", ok, `{"template":"` + t2 + `","logic":"Ag==","programs":1,"uses":[` + uCE + `]}`},
+		{"/v0/template/0000000000000000", 404, ""},
+		{"/v0/template/00000000000000A1", 400, ""},
+		{"/v0/template/a1", 400, ""},
+	} {
+		code, body := get(c.url)
+		if code != c.code || (c.code == ok && body != c.want) {
+			t.Errorf("%s = %d %s, want %d %s", c.url, code, body, c.code, c.want)
+		}
+	}
+
+	track = config{}
+	h = routes(db)
+	for _, url := range []string{"/v0/lsig/" + A, "/v0/delegations/" + D, "/v0/templates", "/v0/template/" + t1} {
+		if code, _ := get(url); code != 404 {
+			t.Errorf("%s with lsigs off = %d, want 404", url, code)
 		}
 	}
 }

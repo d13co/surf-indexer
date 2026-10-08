@@ -1,6 +1,6 @@
 # Algorand Block Fees Service
 
-Stores the timestamp, txn counter and fees of every block of one network in DuckDB, ingested from an archival algod, and serves fee sums and block lookups. Optionally it also stores each block's proposer, payout and evicted (absent) accounts, and the cert voters of recent rounds, serving the [block-proposers](#proposers-and-voters) routes.
+Stores the timestamp, txn counter and fees of every block of one network in DuckDB, ingested from an archival algod, and serves fee sums and block lookups. Optionally it also stores each block's proposer, payout and evicted (absent) accounts, and the cert voters of recent rounds, serving the [block-proposers](#proposers-and-voters) routes. It can also index every logic sig used, with its delegators and template ([logic sigs](#logic-sigs)).
 
 API should be considered **unstable**.
 
@@ -15,7 +15,7 @@ ALGOD_HOST=http://localhost ALGOD_PORT=8080 ALGOD_TOKEN=... ./fees-api mainnet-v
 
 The first argument is the expected genesis ID (startup fails if algod reports another). An optional second argument names the DB: `data/<dbID>.duckdb`, default `data/<genesisID>.duckdb`.
 
-Ingestion starts at round 0 and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks.
+Ingestion starts at round 0 (or `START_ROUND`) and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks, and for every round with `LSIGS` on, which needs each block's txns.
 
 Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
 
@@ -29,7 +29,7 @@ find <algod datadir> -name ledger.block.sqlite
 LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0 mainnet-v1.0-p
 ```
 
-What gets imported is set by `PROPOSERS` and `VOTER_ROUNDS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0` and drop the `-p` DB name.
+What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0` and drop the `-p` DB name.
 
 This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
 
@@ -40,9 +40,19 @@ rm -f data/mainnet-v1.0-p.duckdb.wal   # a stale WAL would be replayed onto the 
 mv data/mainnet-v1.0-p.duckdb.new data/mainnet-v1.0-p.duckdb
 ```
 
-Start the server as usual (`./fees-api mainnet-v1.0 mainnet-v1.0-p`); it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS` and `VOTER_ROUNDS`.
+Start the server as usual (`./fees-api mainnet-v1.0 mainnet-v1.0-p`); it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`.
 
 With proposers on, rounds before the incentives upgrade read their whole cert from the ledger (~60 KB per round, ~2.8 TB over mainnet's first 46.5M rounds), so the import is I/O-bound.
+
+To try a config on recent rounds before a full import, set `START_ROUND` to start an empty DB there, e.g. for the last 3.5M rounds:
+
+```
+L=<path to ledger.block.sqlite>
+S=$(sqlite3 -readonly "$L" 'SELECT max(rnd) - 3500000 FROM blocks'); echo $S   # note it: resuming and serving need the same value
+START_ROUND=$S LSIGS=1 LEDGER_DB=$L CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0 lsig-trial
+```
+
+Such a DB is partial: fee sums, series and logic sig `txns` and `firstRound`s cover only its rounds, and it opens only with the same `START_ROUND` (and a DB from round 0 only without it).
 
 It is safe to run beside a live algod: the DB is opened read-only, and WAL readers don't block algod's writes. It does compete with algod for disk, page cache and CPU, so watch algod's lag (`goal node status`) and throttle with `CONCURRENCY`, or stop algod for the duration.
 
@@ -58,7 +68,7 @@ All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC 
 {"maxRound":46513899,"ok":1,"records":46513900}
 ```
 
-Sanity check: `records` should be `maxRound + 1` (round 0 is stored).
+Sanity check: `records` should be `maxRound + 1` (round 0 is stored), or `maxRound + 1 - START_ROUND` for a trial.
 
 ### Block lookup
 
@@ -191,6 +201,32 @@ Clients switching from block-proposers should expect:
 
 Unchanged: paths, JSON keys, `pp` omitted when 0, the stats shape, eviction ordering and `exists`. Added: `start`/`end` on every ranged route, and explicit oldest-first order where block-proposers relied on insertion order.
 
+### Logic sigs
+
+These routes exist only with `LSIGS` on; otherwise they 404.
+
+Every txn authorized by a logic sig is indexed (inner txns have none): by an escrow, where the authorizer is the program's own address, or by a delegation, where an account signed the program (by sig, msig, lmsig or pqsig). Rows are per program, delegator and rekeyed sender, without per-round history, so lists of uses are newest first by `lastRound`, and every list is capped by `limit` (default 1000, at most 100000). A use:
+
+```
+{"lsig":"…","template":"3f2c9a1b7d0e4c55","signer":null,"sender":null,"txns":12,"firstRound":46000000,"lastRound":46500000}
+```
+
+- `lsig`: the program's address, `Hash("Program" || program)`
+- `template`: its template id (below)
+- `signer`: the delegator, i.e. the authorizer that signed the program; `null` for an escrow
+- `sender`: the sender when rekeyed (to the escrow, or to `signer`), else `null`
+- `txns`: the txns it authorized; `firstRound`, `lastRound`: the first and last round it did, so a txn can be looked up there
+
+**Templates.** Many lsigs are one program filled in with other values (TMPL_ variables, per-user or pool escrows). A template id hashes the program with its constants and branch offsets left out, so such programs share it: constant blocks are dropped, and every int load (`intc*`, `pushint`) counts as one op and every bytes load (`bytec*`, `pushbytes`) as another, because goal's assembler merges equal values and orders blocks by use, so one source assembles differently per value. That also covers autosalting: from TEAL v13, goal adds a salt (an extra `intcblock` entry, or a trailing `intcblock`) to a program whose address would be an Ed25519 key, so salted and unsalted instances share a template. That is the same opcode sequence, while constants **and branch targets** may differ: anyone can fill a template with their own values, so never use it to judge a lsig genuine. A program that doesn't parse, or has a TEAL version newer than this build knows (13), is its own template. Template ids from a build that knows another version can differ, so a DB built with one should be rebuilt rather than ingested into by another.
+
+`/v0/lsig/<address>`: `{"template":"…","programs":1234,"uses":[…]}`, where `programs` counts the distinct programs of its template, or 404 if the lsig was never used.
+
+`/v0/delegations/<address>`: uses where the address is the `signer` or the `sender`: the lsigs it delegated, and those that moved it while rekeyed. `[]` if none.
+
+`/v0/templates`: templates with 2 or more programs, or delegated by 2 or more accounts, most programs first: `[{"template":"…","programs":1234,"delegators":0,"txns":56789,"firstRound":…,"lastRound":…}, ...]`. `delegators` counts the distinct signers.
+
+`/v0/template/<id>`: `{"template":"…","logic":"<base64>","programs":1234,"uses":[…]}`, or 404. `logic` is the first program seen of the template (disassemble it with `goal clerk compile -D`). `id` is 16 lowercase hex digits.
+
 ## Environment Variables
 
 | name        | description                                                    | default_value    |
@@ -204,7 +240,9 @@ Unchanged: paths, JSON keys, `pp` omitted when 0, the stats shape, eviction orde
 | LEDGER_DB   | Path to an archival `ledger.block.sqlite`: bulk load and exit  |                  |
 | PROPOSERS   | Store each block's proposer, payout and evicted accounts       | true             |
 | VOTER_ROUNDS | Store cert voters of the last N rounds; 0 for none            | 100000           |
+| LSIGS       | Store logic sig uses, delegators and templates                 | false            |
+| START_ROUND | Trials only: an empty DB starts at this round ([bulk load](#bulk-load-from-an-archival-nodes-ledger)) | 0 |
 
-`PROPOSERS` and `VOTER_ROUNDS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it.
+`PROPOSERS`, `VOTER_ROUNDS` and `LSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens.
 
-Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB.
+Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB. Logic sigs take an estimated ~80 B per (program, signer, sender) plus one program per template, growing with distinct programs rather than rounds. With `LSIGS` on every round is a full block fetch: free at the tip while `VOTER_ROUNDS` is above 0, else ~70 KB per block (~2 GB/day) over REST, and a ledger import reads whole blocks after the incentives upgrade too.

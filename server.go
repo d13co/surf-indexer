@@ -33,6 +33,14 @@ func parseTime(s string) (uint64, error) {
 
 func parseRound(s string) (uint64, error) { return strconv.ParseUint(s, 10, 32) }
 
+func parseLimit(s string) (uint64, error) {
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err == nil && (n < 1 || n > 100000) {
+		err = errors.New("want 1 to 100000")
+	}
+	return n, err
+}
+
 // opt parses q[name], or returns def if it is absent.
 func opt(q url.Values, name string, def uint64, parse func(string) (uint64, error)) (uint64, error) {
 	if v := q.Get(name); v != "" {
@@ -263,6 +271,57 @@ func routes(db *sql.DB) http.Handler {
 		ranged("GET /v0/voters", `SELECT coalesce(to_json(list({'voter': voter, 'blocks': n} ORDER BY n DESC, voter))::VARCHAR, '[]')
 			FROM (SELECT voter, count(*) AS n FROM voters WHERE`+in+` GROUP BY voter)`)
 		ranged("GET /v0/voter/{addr}", `SELECT coalesce(to_json(list(rnd ORDER BY rnd))::VARCHAR, '[]') FROM voters WHERE voter = $3 AND`+in)
+	}
+	if track.Lsigs {
+		// limited serves q with ?limit as $1 and, for an {addr} or {id} pattern, that value as $2.
+		limited := func(pattern, q string) {
+			withAddr, withID := strings.Contains(pattern, "{addr}"), strings.Contains(pattern, "{id}")
+			mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+				n, err := opt(r.URL.Query(), "limit", 1000, parseLimit)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				args := []any{n}
+				switch {
+				case withAddr:
+					a, ok := addr(w, r)
+					if !ok {
+						return
+					}
+					args = append(args, a)
+				case withID:
+					id := r.PathValue("id")
+					if len(id) != 16 || strings.Trim(id, "0123456789abcdef") != "" {
+						http.Error(w, "id: want 16 lowercase hex digits", http.StatusBadRequest)
+						return
+					}
+					args = append(args, id)
+				}
+				replySQL(w, r, db, q, args...)
+			})
+		}
+		// uses lists the newest $1 rows matching where; NULL if none. '' stands for NULL in signer/sender.
+		uses := func(where string) string {
+			const newest = " ORDER BY last_rnd DESC, prog, signer, sender"
+			return `(SELECT list({'lsig': prog, 'template': tmpl, 'signer': nullif(signer, ''), 'sender': nullif(sender, ''),
+				'txns': txns, 'firstRound': first_rnd, 'lastRound': last_rnd}` + newest + `)
+				FROM (SELECT * FROM lsigs WHERE ` + where + newest + ` LIMIT $1))`
+		}
+		// Driven by the lsig's newest row, so one never seen has none: 404.
+		limited("GET /v0/lsig/{addr}", `SELECT to_json({'template': tmpl,
+			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = l.tmpl), 'uses': `+uses("prog = $2")+`})::VARCHAR
+			FROM (SELECT tmpl FROM lsigs WHERE prog = $2 ORDER BY last_rnd DESC LIMIT 1) l`)
+		limited("GET /v0/delegations/{addr}", `SELECT coalesce(to_json(`+uses("signer = $2 OR sender = $2")+`)::VARCHAR, '[]')`)
+		// Families of programs, and single programs delegated by several accounts.
+		// ponytail: groups every row per request (~0.7s at 3M rows); cache it if it gets hot.
+		limited("GET /v0/templates", `SELECT coalesce(to_json(list({'template': tmpl, 'programs': p, 'delegators': d, 'txns': n,
+			'firstRound': f, 'lastRound': l} ORDER BY p DESC, tmpl))::VARCHAR, '[]')
+			FROM (SELECT tmpl, count(DISTINCT prog) AS p, count(DISTINCT signer) FILTER (WHERE signer <> '') AS d, sum(txns) AS n,
+				min(first_rnd) AS f, max(last_rnd) AS l FROM lsigs GROUP BY tmpl HAVING p >= 2 OR d >= 2 ORDER BY p DESC, tmpl LIMIT $1)`)
+		limited("GET /v0/template/{id}", `SELECT to_json({'template': tmpl, 'logic': logic,
+			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = $2), 'uses': `+uses("tmpl = $2")+`})::VARCHAR
+			FROM lsig_templates WHERE tmpl = $2`)
 	}
 	if track.Proposers || track.VoterRounds > 0 {
 		mux.HandleFunc("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
