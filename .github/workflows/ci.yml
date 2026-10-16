@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A PR can push repeatedly; cancel superseded runs so untrusted code cannot
+# stack unbounded concurrent jobs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Only this repository: forks do not run its CI.
+    if: github.repository == 'd13co/surf-indexer'
+    runs-on: ubuntu-latest
+    # Untrusted PR code runs below; cap it well under the 6-hour default.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The next steps execute PR-controlled code; do not leave the
+          # GITHUB_TOKEN in .git/config for it to read.
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race -count=1 ./...
+      - run: sh -n deploy/postinst.sh .github/apt-publish.sh
+      # Catch packaging mistakes before a tag does.
+      - run: go build -o bin/surf-indexer .
+      - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+      - run: DEB_VERSION=0.0.0 ARCH=amd64 nfpm pkg -p deb -t "$RUNNER_TEMP"

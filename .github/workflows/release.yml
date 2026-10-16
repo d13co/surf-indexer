@@ -1,0 +1,90 @@
+name: release
+
+# Version tags (v1.2.3) publish a release with the linux amd64 and arm64
+# binaries and .debs, and publish the .debs to https://apt.d13.co.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.repository == 'd13co/surf-indexer'
+    # CGO (DuckDB) links glibc dynamically: building on 22.04 keeps the
+    # binaries running on Debian 12 and Ubuntu 22.04 (see nfpm.yaml's depends).
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+      # amd64 last: the version check below runs bin/surf-indexer.
+      - name: Build the binaries and .debs
+        run: |
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            cross=; [ $arch = arm64 ] && cross=aarch64-linux-gnu-
+            GOARCH=$arch CC=${cross}gcc CXX=${cross}g++ CGO_ENABLED=1 \
+              go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o bin/surf-indexer .
+            cp bin/surf-indexer dist/surf-indexer-linux-$arch
+            DEB_VERSION=${GITHUB_REF_NAME#v} ARCH=$arch nfpm pkg -p deb -t dist/
+          done
+          cd dist && sha256sum surf-indexer-linux-* *.deb > checksums.txt
+      - name: Check the version is stamped
+        run: |
+          v=$(./bin/surf-indexer version | awk '{print $2}')
+          [ "$v" = "${GITHUB_REF_NAME}" ] || { echo "binary says $v, tag is $GITHUB_REF_NAME"; exit 1; }
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes dist/*
+
+  # Separate from release so a failed publish can be re-run on its own.
+  apt:
+    needs: release
+    environment: apt # holds the signing and R2 secrets; v* tags only, needs approval
+    runs-on: ubuntu-latest
+    # ponytail: one index rebuild at a time within this repo only; the bucket is
+    # shared with algod-loadb-mesh, so don't approve this while its apt job runs.
+    concurrency: apt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download the .debs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -D dist -p '*.deb' -p checksums.txt
+          cd dist && sha256sum -c --ignore-missing checksums.txt
+      - name: Import the signing subkey
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: echo "$APT_SIGNING_KEY" | gpg --batch --import
+      - name: Publish to apt.d13.co
+        env:
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          printf %s "$APT_SIGNING_PASSPHRASE" > "$RUNNER_TEMP/pass"
+          GPG_PASSPHRASE_FILE=$RUNNER_TEMP/pass APT_REPO=$RUNNER_TEMP/apt .github/apt-publish.sh dist/*.deb
+      - name: Check apt.d13.co lists the release
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          for a in amd64 arm64; do
+            curl -fsS https://apt.d13.co/dists/stable/main/binary-$a/Packages?v=$v |
+              grep -qx "Filename: pool/surf-indexer_${v}_$a.deb" || { echo "no $v for $a"; exit 1; }
+          done

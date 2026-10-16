@@ -1,4 +1,4 @@
-# Algorand Block Fees Service
+# surf-indexer
 
 Stores the timestamp, txn counter and fees of every block of one network in DuckDB, ingested from an archival algod, and serves fee sums and block lookups. Optionally it also stores each block's proposer, payout and evicted (absent) accounts, and the cert voters of recent rounds, serving the [block-proposers](#proposers-and-voters) routes. It can also index every logic sig used, with its delegators and template ([logic sigs](#logic-sigs)).
 
@@ -9,8 +9,8 @@ API should be considered **unstable**.
 Requires Go 1.26+ and CGO (DuckDB).
 
 ```
-go build -o fees-api .
-ALGOD_HOST=http://localhost ALGOD_PORT=8080 ALGOD_TOKEN=... ./fees-api mainnet-v1.0
+go build -o surf-indexer .
+ALGOD_HOST=http://localhost ALGOD_PORT=8080 ALGOD_TOKEN=... ./surf-indexer mainnet-v1.0
 ```
 
 The first argument is the expected genesis ID (startup fails if algod reports another). An optional second argument names the DB: `data/<dbID>.duckdb`, default `data/<genesisID>.duckdb`.
@@ -19,6 +19,30 @@ Ingestion starts at round 0 (or `START_ROUND`) and catches up in parallel batche
 
 Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
 
+### Install from apt
+
+On Debian 12+ and Ubuntu 22.04+ (amd64, arm64), from the apt repository at `https://apt.d13.co`:
+
+```
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://apt.d13.co/key.asc -o /etc/apt/keyrings/d13co.asc
+echo "deb [signed-by=/etc/apt/keyrings/d13co.asc] https://apt.d13.co stable main" | sudo tee /etc/apt/sources.list.d/d13co.list
+sudo apt update && sudo apt install surf-indexer
+```
+
+The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`):
+
+```
+sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=..., PORT=...
+sudo systemctl enable --now surf-indexer@mainnet-v1.0
+```
+
+Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. To switch to another DB of the same network, e.g. one rebuilt with other `PROPOSERS`, `VOTER_ROUNDS` or `LSIGS`, set `DB_ID=<dbID>` in the env file and restart; remove it to switch back. `apt upgrade` restarts running instances.
+
+### Releasing
+
+Push a `v1.2.3` tag. The release workflow tests, builds the linux amd64 and arm64 binaries and `.deb`s into a GitHub release, then, once approved in the `apt` environment, adds the `.deb`s to the apt repository and signs its index ([.github/apt-publish.sh](.github/apt-publish.sh)).
+
 ### Bulk load from an archival node's ledger
 
 Catching up from round 0 over REST is slow. On the archival node's machine, read its block DB directly instead, then copy the DuckDB file to the server:
@@ -26,21 +50,21 @@ Catching up from round 0 over REST is slow. On the archival node's machine, read
 ```
 # on the archival node, as the algod user: any -shm/-wal files SQLite creates must stay algod's
 find <algod datadir> -name ledger.block.sqlite
-LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0 mainnet-v1.0-p
+LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0
 ```
 
-What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0` and drop the `-p` DB name.
+What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0`.
 
 This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
 
 ```
-rsync -P data/mainnet-v1.0-p.duckdb server:fees-api/data/mainnet-v1.0-p.duckdb.new
+rsync -P data/mainnet-v1.0.duckdb server:surf-indexer/data/mainnet-v1.0.duckdb.new
 # on the server
-rm -f data/mainnet-v1.0-p.duckdb.wal   # a stale WAL would be replayed onto the new file
-mv data/mainnet-v1.0-p.duckdb.new data/mainnet-v1.0-p.duckdb
+rm -f data/mainnet-v1.0.duckdb.wal   # a stale WAL would be replayed onto the new file
+mv data/mainnet-v1.0.duckdb.new data/mainnet-v1.0.duckdb
 ```
 
-Start the server as usual (`./fees-api mainnet-v1.0 mainnet-v1.0-p`); it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`.
+Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`.
 
 With proposers on, rounds before the incentives upgrade read their whole cert from the ledger (~60 KB per round, ~2.8 TB over mainnet's first 46.5M rounds), so the import is I/O-bound.
 
@@ -49,7 +73,7 @@ To try a config on recent rounds before a full import, set `START_ROUND` to star
 ```
 L=<path to ledger.block.sqlite>
 S=$(sqlite3 -readonly "$L" 'SELECT max(rnd) - 3500000 FROM blocks'); echo $S   # note it: resuming and serving need the same value
-START_ROUND=$S LSIGS=1 LEDGER_DB=$L CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./fees-api mainnet-v1.0 lsig-trial
+START_ROUND=$S LSIGS=1 LEDGER_DB=$L CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0 lsig-trial
 ```
 
 Such a DB is partial: fee sums, series and logic sig `txns` and `firstRound`s cover only its rounds, and it opens only with the same `START_ROUND` (and a DB from round 0 only without it).
