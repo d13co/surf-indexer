@@ -50,11 +50,12 @@ type block struct {
 }
 
 // config is what a DB tracks besides fees. It is fixed once the DB holds a block.
+// Each field also gates its routes; /v0/status reports them under the json names.
 type config struct {
-	Proposers   bool   // proposer, payout and absent accounts per block
-	VoterRounds uint64 // cert voters of the last VoterRounds rounds; 0: none
-	Lsigs       bool   // lsig programs, delegators, rekeyed senders and templates (lsigs, lsig_templates)
-	Msigs       bool   // multisig subsigners (msig_signers)
+	Proposers   bool   `json:"proposers"`   // proposer, payout and absent accounts per block
+	VoterRounds uint64 `json:"voterRounds"` // cert voters of the last VoterRounds rounds; 0: none
+	Lsigs       bool   `json:"lsigs"`       // lsig programs, delegators, rekeyed senders and templates (lsigs, lsig_templates)
+	Msigs       bool   `json:"msigs"`       // multisig subsigners (msig_signers)
 }
 
 // fullBlocks is whether every round needs its payset.

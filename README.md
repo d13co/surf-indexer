@@ -90,10 +90,12 @@ All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC 
 `/v0/status`
 
 ```
-{"maxRound":46513899,"ok":1,"records":46513900}
+{"ok":1,"maxRound":46513899,"records":46513900,"proposers":true,"voterRounds":100000,"lsigs":true,"msigs":true}
 ```
 
 Sanity check: `records` should be `maxRound + 1` (round 0 is stored), or `maxRound + 1 - START_ROUND` for a trial.
+
+`proposers`, `voterRounds`, `lsigs` and `msigs` are the `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` this instance runs with. A feature that is off (`false`, or `voterRounds` 0) has no routes: they return 404. Clients should check these before calling the feature routes, since several of those also use 404 to mean "not seen".
 
 ### Block lookup
 

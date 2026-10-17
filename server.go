@@ -142,7 +142,13 @@ func routes(db *sql.DB) http.Handler {
 
 	mux.HandleFunc("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
 		n, _, hi, err := rounds(r.Context(), db)
-		reply(w, map[string]int64{"ok": 1, "maxRound": hi, "records": n}, err)
+		// The config says which feature routes exist: those off are 404s.
+		reply(w, struct {
+			OK       int   `json:"ok"`
+			MaxRound int64 `json:"maxRound"`
+			Records  int64 `json:"records"`
+			config
+		}{1, hi, n, track}, err)
 	})
 
 	mux.HandleFunc("GET /v0/block", func(w http.ResponseWriter, r *http.Request) {
