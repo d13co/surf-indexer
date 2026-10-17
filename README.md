@@ -33,7 +33,8 @@ sudo apt update && sudo apt install surf-indexer
 The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`):
 
 ```
-sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=..., PORT=...
+sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=..., PORT=..., ADMIN_TOKEN=...
+sudo chmod 600 /etc/surf-indexer/mainnet-v1.0.env   # it holds tokens; systemd reads it as root
 sudo systemctl enable --now surf-indexer@mainnet-v1.0
 ```
 
@@ -249,7 +250,23 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 
 `/v0/templates`: templates with 2 or more programs, or delegated by 2 or more accounts, most programs first: `[{"template":"…","programs":1234,"delegators":0,"txns":56789,"firstRound":…,"lastRound":…}, ...]`. `delegators` counts the distinct signers.
 
-`/v0/template/<id>`: `{"template":"…","logic":"<base64>","programs":1234,"uses":[…]}`, or 404. `logic` is the first program seen of the template (disassemble it with `goal clerk compile -D`). `id` is 16 lowercase hex digits.
+`/v0/template/<id>`: `{"template":"…","name":null,"logic":"<base64>","programs":1234,"uses":[…]}`, or 404. `logic` is the first program seen of the template (disassemble it with `goal clerk compile -D`). `id` is 16 lowercase hex digits.
+
+`name`, also in `/v0/templates` and `/v0/lsig/<address>`, is the template's name as set by an [admin](#admin), or `null`.
+
+### Admin
+
+These routes exist only with `ADMIN_TOKEN` set, which needs `LSIGS` on (startup fails otherwise); without it they 404. Each needs the header `Authorization: Bearer <ADMIN_TOKEN>`, else 401. They are meant for curl, not browsers: there is no CORS preflight.
+
+`PUT /v0/admin/template/<id>` with body `{"name":"Tinyman v1 pool"}`: names a template, replacing any name. The name is trimmed, and must be 1 to 100 visible characters or spaces: no control, zero-width or text-direction characters (400 otherwise; 413 for a body over 4 KiB). Returns `{"name":"…","template":"…"}`, or 404 if no lsig of that template was seen.
+
+```
+curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"name":"Tinyman v1 pool"}' localhost:8118/v0/admin/template/3f2c9a1b7d0e4c55
+```
+
+`DELETE /v0/admin/template/<id>`: removes its name. 204 whether or not it had one.
+
+Names are stored in the DB (`template_names`), so a rebuilt DB starts without them. Copy them over with the `duckdb` CLI, server stopped: `duckdb new.duckdb "ATTACH 'old.duckdb' AS o (READ_ONLY); INSERT INTO template_names SELECT * FROM o.template_names"`.
 
 ### Multisig subsigners
 
@@ -285,6 +302,7 @@ A multisig preimage this build can't read (a new msig version, or a key that isn
 | VOTER_ROUNDS | Store cert voters of the last N rounds; 0 for none            | 100000           |
 | LSIGS       | Store logic sig uses, delegators and templates                 | false            |
 | MSIGS       | Store multisig subsigners, whether each signed, and a txn      | false            |
+| ADMIN_TOKEN | Enables the [admin](#admin) routes (needs `LSIGS`); 16+ printable ASCII characters, no spaces, e.g. `openssl rand -hex 32` |                  |
 | START_ROUND | Trials only: an empty DB starts at this round ([bulk load](#bulk-load-from-an-archival-nodes-ledger)) | 0 |
 
 `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.

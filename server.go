@@ -125,6 +125,16 @@ func addr(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return a, true
 }
 
+// tmplID returns the {id} path value, replying 400 if it isn't a template id.
+func tmplID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PathValue("id")
+	if len(id) != 16 || strings.Trim(id, "0123456789abcdef") != "" {
+		http.Error(w, "id: want 16 lowercase hex digits", http.StatusBadRequest)
+		return "", false
+	}
+	return id, true
+}
+
 var periods = map[string]time.Duration{"24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour, "30d": 30 * 24 * time.Hour}
 
 func routes(db *sql.DB) http.Handler {
@@ -290,9 +300,8 @@ func routes(db *sql.DB) http.Handler {
 				}
 				args = append(args, a)
 			case withID:
-				id := r.PathValue("id")
-				if len(id) != 16 || strings.Trim(id, "0123456789abcdef") != "" {
-					http.Error(w, "id: want 16 lowercase hex digits", http.StatusBadRequest)
+				id, ok := tmplID(w, r)
+				if !ok {
 					return
 				}
 				args = append(args, id)
@@ -309,19 +318,24 @@ func routes(db *sql.DB) http.Handler {
 				FROM (SELECT * FROM lsigs WHERE ` + where + newest + ` LIMIT $1))`
 		}
 		// Driven by the lsig's newest row, so one never seen has none: 404.
-		limited("GET /v0/lsig/{addr}", `SELECT to_json({'template': tmpl,
+		// name is the admin-set template name, or null.
+		const name = `(SELECT name FROM template_names n WHERE n.tmpl = `
+		limited("GET /v0/lsig/{addr}", `SELECT to_json({'template': tmpl, 'name': `+name+`l.tmpl),
 			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = l.tmpl), 'uses': `+uses("prog = $2")+`})::VARCHAR
 			FROM (SELECT tmpl FROM lsigs WHERE prog = $2 ORDER BY last_rnd DESC LIMIT 1) l`)
 		limited("GET /v0/delegations/{addr}", `SELECT coalesce(to_json(`+uses("signer = $2 OR sender = $2")+`)::VARCHAR, '[]')`)
 		// Families of programs, and single programs delegated by several accounts.
 		// ponytail: groups every row per request (~0.7s at 3M rows); cache it if it gets hot.
-		limited("GET /v0/templates", `SELECT coalesce(to_json(list({'template': tmpl, 'programs': p, 'delegators': d, 'txns': n,
+		limited("GET /v0/templates", `SELECT coalesce(to_json(list({'template': tmpl, 'name': `+name+`t.tmpl), 'programs': p, 'delegators': d, 'txns': n,
 			'firstRound': f, 'lastRound': l} ORDER BY p DESC, tmpl))::VARCHAR, '[]')
 			FROM (SELECT tmpl, count(DISTINCT prog) AS p, count(DISTINCT signer) FILTER (WHERE signer <> '') AS d, sum(txns) AS n,
-				min(first_rnd) AS f, max(last_rnd) AS l FROM lsigs GROUP BY tmpl HAVING p >= 2 OR d >= 2 ORDER BY p DESC, tmpl LIMIT $1)`)
-		limited("GET /v0/template/{id}", `SELECT to_json({'template': tmpl, 'logic': logic,
+				min(first_rnd) AS f, max(last_rnd) AS l FROM lsigs GROUP BY tmpl HAVING p >= 2 OR d >= 2 ORDER BY p DESC, tmpl LIMIT $1) t`)
+		limited("GET /v0/template/{id}", `SELECT to_json({'template': tmpl, 'name': `+name+`$2), 'logic': logic,
 			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = $2), 'uses': `+uses("tmpl = $2")+`})::VARCHAR
 			FROM lsig_templates WHERE tmpl = $2`)
+		if adminToken != "" {
+			adminRoutes(mux, db)
+		}
 	}
 	if track.Msigs {
 		// A row's round and index point at one txn: payset[index] of that block, the first the signer

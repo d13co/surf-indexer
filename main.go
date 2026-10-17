@@ -159,6 +159,10 @@ func main() {
 		fatal("VOTER_ROUNDS: expected < 2^32", "got", voterRounds)
 	}
 	track = config{Proposers: envBool("PROPOSERS", true), VoterRounds: uint64(voterRounds), Lsigs: envBool("LSIGS", false), Msigs: envBool("MSIGS", false)}
+	adminToken = os.Getenv("ADMIN_TOKEN")
+	if err := checkAdminToken(adminToken, track.Lsigs); err != nil {
+		fatal("ADMIN_TOKEN: " + err.Error())
+	}
 	if startRound = uint64(envInt("START_ROUND", 0, 0)); startRound > math.MaxUint32 {
 		fatal("START_ROUND: expected < 2^32", "got", startRound)
 	}
@@ -168,7 +172,7 @@ func main() {
 
 	concurrency, chunk, ledger, port := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1), os.Getenv("LEDGER_DB"), envStr("PORT", "8118")
 	slog.Info("config", "version", version, "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", ledger, "port", port,
-		"proposers", track.Proposers, "voterRounds", track.VoterRounds, "lsigs", track.Lsigs, "msigs", track.Msigs, "startRound", startRound)
+		"proposers", track.Proposers, "voterRounds", track.VoterRounds, "lsigs", track.Lsigs, "msigs", track.Msigs, "startRound", startRound, "admin", adminToken != "")
 	if ledger != "" {
 		importLedger(ctx, ledger, genesisID, dbID, concurrency, chunk)
 		return

@@ -76,6 +76,10 @@ const lsigTables = `CREATE TABLE IF NOT EXISTS lsigs(
 CREATE TABLE IF NOT EXISTS lsig_templates(
 	tmpl  VARCHAR NOT NULL,
 	logic VARCHAR NOT NULL -- base64 program of the first instance seen (duckdb-go binds no BLOB in a list)
+);
+CREATE TABLE IF NOT EXISTS template_names(
+	tmpl VARCHAR PRIMARY KEY, -- set by an admin, not ingest; a PK is cheap on a table this small
+	name VARCHAR NOT NULL
 )`
 
 // msigTable is kept out of schema for the same reason as lsigTables: its presence is the stored Msigs flag.
@@ -160,7 +164,7 @@ func setup(db *sql.DB, path, genesisID string) error {
 	if err == nil && track.Lsigs { // no-ops on a DB with blocks, where have == track
 		_, err = tx.Exec(lsigTables)
 	} else if err == nil {
-		_, err = tx.Exec("DROP TABLE IF EXISTS lsigs; DROP TABLE IF EXISTS lsig_templates")
+		_, err = tx.Exec("DROP TABLE IF EXISTS lsigs; DROP TABLE IF EXISTS lsig_templates; DROP TABLE IF EXISTS template_names")
 	}
 	if err == nil && track.Msigs {
 		_, err = tx.Exec(msigTable)

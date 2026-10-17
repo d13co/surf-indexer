@@ -971,9 +971,9 @@ func TestLsigRoutes(t *testing.T) {
 		code int
 		want string
 	}{
-		{"/v0/lsig/" + A, ok, `{"template":"` + t1 + `","programs":2,"uses":[` + uA + `]}`},
-		{"/v0/lsig/" + C, ok, `{"template":"` + t2 + `","programs":1,"uses":[` + uCE + "," + uC + `]}`},
-		{"/v0/lsig/" + C + "?limit=1", ok, `{"template":"` + t2 + `","programs":1,"uses":[` + uCE + `]}`},
+		{"/v0/lsig/" + A, ok, `{"template":"` + t1 + `","name":null,"programs":2,"uses":[` + uA + `]}`},
+		{"/v0/lsig/" + C, ok, `{"template":"` + t2 + `","name":null,"programs":1,"uses":[` + uCE + "," + uC + `]}`},
+		{"/v0/lsig/" + C + "?limit=1", ok, `{"template":"` + t2 + `","name":null,"programs":1,"uses":[` + uCE + `]}`},
 		{"/v0/lsig/" + D, 404, ""}, // a delegator, not a program
 		{"/v0/lsig/nope", 400, ""},
 		{"/v0/lsig/" + A + "?limit=0", 400, ""},
@@ -981,12 +981,12 @@ func TestLsigRoutes(t *testing.T) {
 		{"/v0/delegations/" + E, ok, "[" + uCE + "]"},
 		{"/v0/delegations/" + A, ok, "[]"},
 		// t2 is one program with one delegator: not listed.
-		{"/v0/templates", ok, `[{"template":"` + t1 + `","programs":2,"delegators":0,"txns":3,"firstRound":1,"lastRound":2},` +
-			`{"template":"` + t3 + `","programs":1,"delegators":2,"txns":2,"firstRound":4,"lastRound":4}]`},
+		{"/v0/templates", ok, `[{"template":"` + t1 + `","name":null,"programs":2,"delegators":0,"txns":3,"firstRound":1,"lastRound":2},` +
+			`{"template":"` + t3 + `","name":null,"programs":1,"delegators":2,"txns":2,"firstRound":4,"lastRound":4}]`},
 		{"/v0/templates?limit=x", 400, ""},
 		{"/v0/templates?limit=100001", 400, ""},
-		{"/v0/template/" + t1, ok, `{"template":"` + t1 + `","logic":"AQ==","programs":2,"uses":[` + uB + "," + uA + `]}`},
-		{"/v0/template/" + t2 + "?limit=1", ok, `{"template":"` + t2 + `","logic":"Ag==","programs":1,"uses":[` + uCE + `]}`},
+		{"/v0/template/" + t1, ok, `{"template":"` + t1 + `","name":null,"logic":"AQ==","programs":2,"uses":[` + uB + "," + uA + `]}`},
+		{"/v0/template/" + t2 + "?limit=1", ok, `{"template":"` + t2 + `","name":null,"logic":"Ag==","programs":1,"uses":[` + uCE + `]}`},
 		{"/v0/template/0000000000000000", 404, ""},
 		{"/v0/template/00000000000000A1", 400, ""},
 		{"/v0/template/a1", 400, ""},
