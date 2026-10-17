@@ -15,7 +15,7 @@ ALGOD_HOST=http://localhost ALGOD_PORT=8080 ALGOD_TOKEN=... ./surf-indexer mainn
 
 The first argument is the expected genesis ID (startup fails if algod reports another). An optional second argument names the DB: `data/<dbID>.duckdb`, default `data/<genesisID>.duckdb`.
 
-Ingestion starts at round 0 (or `START_ROUND`) and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks, and for every round with `LSIGS` on, which needs each block's txns.
+Ingestion starts at round 0 (or `START_ROUND`) and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks, and for every round with `LSIGS` or `MSIGS` on, which need each block's txns.
 
 Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
 
@@ -37,7 +37,7 @@ sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=...,
 sudo systemctl enable --now surf-indexer@mainnet-v1.0
 ```
 
-Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. To switch to another DB of the same network, e.g. one rebuilt with other `PROPOSERS`, `VOTER_ROUNDS` or `LSIGS`, set `DB_ID=<dbID>` in the env file and restart; remove it to switch back. `apt upgrade` restarts running instances.
+Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. To switch to another DB of the same network, e.g. one rebuilt with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`, set `DB_ID=<dbID>` in the env file and restart; remove it to switch back. `apt upgrade` restarts running instances.
 
 ### Releasing
 
@@ -53,7 +53,7 @@ find <algod datadir> -name ledger.block.sqlite
 LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0
 ```
 
-What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0`.
+What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0`.
 
 This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
 
@@ -64,7 +64,7 @@ rm -f data/mainnet-v1.0.duckdb.wal   # a stale WAL would be replayed onto the ne
 mv data/mainnet-v1.0.duckdb.new data/mainnet-v1.0.duckdb
 ```
 
-Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS`, `VOTER_ROUNDS` and `LSIGS`.
+Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS`.
 
 With proposers on, rounds before the incentives upgrade read their whole cert from the ledger (~60 KB per round, ~2.8 TB over mainnet's first 46.5M rounds), so the import is I/O-bound.
 
@@ -76,7 +76,7 @@ S=$(sqlite3 -readonly "$L" 'SELECT max(rnd) - 3500000 FROM blocks'); echo $S   #
 START_ROUND=$S LSIGS=1 LEDGER_DB=$L CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0 lsig-trial
 ```
 
-Such a DB is partial: fee sums, series and logic sig `txns` and `firstRound`s cover only its rounds, and it opens only with the same `START_ROUND` (and a DB from round 0 only without it).
+Such a DB is partial: fee sums, series, logic sig `txns` and `firstRound`s, and multisig pointers and `signed` cover only its rounds, and it opens only with the same `START_ROUND` (and a DB from round 0 only without it).
 
 It is safe to run beside a live algod: the DB is opened read-only, and WAL readers don't block algod's writes. It does compete with algod for disk, page cache and CPU, so watch algod's lag (`goal node status`) and throttle with `CONCURRENCY`, or stop algod for the duration.
 
@@ -251,6 +251,25 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 
 `/v0/template/<id>`: `{"template":"…","logic":"<base64>","programs":1234,"uses":[…]}`, or 404. `logic` is the first program seen of the template (disassemble it with `goal clerk compile -D`). `id` is 16 lowercase hex digits.
 
+### Multisig subsigners
+
+These routes exist only with `MSIGS` on; otherwise they 404.
+
+Every multisig that authorized a top-level txn is indexed (inner txns have none): the txn's own msig, or one that signed its delegated logic sig (msig or lmsig). The multisig address comes from its preimage, so it is the txn's authorizer, which differs from the sender when rekeyed. There is one row per subsigner and multisig, without history, pointing at one txn: the first the subsigner signed, or while it never has, the first that used the multisig. Lists are newest pointer first and capped by `limit` (default 1000, at most 100000). A row:
+
+```
+{"msig":"…","signed":true,"round":46500000,"index":3}
+```
+
+- `signed`: whether this key ever signed for this multisig. For an old-style delegated logic sig (msig, valid until consensus v41), the key signed only the program, not bound to the multisig, so anyone could copy that sig into another multisig holding the key: there `signed` means the key signed the program. A txn msig, and an lmsig, are bound to the multisig.
+- `round`, `index`: the txn is `index` in that block's payset (top-level txns only: not the indexer's `intra`, which also counts inner txns)
+
+`/v0/subsigner/<address>`: the multisigs the key belongs to, as above. `[]` if none.
+
+`/v0/msig/<address>`: the subsigners of a multisig, with `signer` in place of `msig`. `[]` if it was never used.
+
+A multisig preimage this build can't read (a new msig version, or a key that isn't 32 bytes) is skipped with an `msig skipped` warning in the log, leaving a gap: upgrade the binary and rebuild if that appears.
+
 ## Environment Variables
 
 | name        | description                                                    | default_value    |
@@ -265,8 +284,9 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 | PROPOSERS   | Store each block's proposer, payout and evicted accounts       | true             |
 | VOTER_ROUNDS | Store cert voters of the last N rounds; 0 for none            | 100000           |
 | LSIGS       | Store logic sig uses, delegators and templates                 | false            |
+| MSIGS       | Store multisig subsigners, whether each signed, and a txn      | false            |
 | START_ROUND | Trials only: an empty DB starts at this round ([bulk load](#bulk-load-from-an-archival-nodes-ledger)) | 0 |
 
-`PROPOSERS`, `VOTER_ROUNDS` and `LSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens.
+`PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.
 
-Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB. Logic sigs take an estimated ~80 B per (program, signer, sender) plus one program per template, growing with distinct programs rather than rounds. With `LSIGS` on every round is a full block fetch: free at the tip while `VOTER_ROUNDS` is above 0, else ~70 KB per block (~2 GB/day) over REST, and a ledger import reads whole blocks after the incentives upgrade too.
+Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB. Logic sigs take an estimated ~80 B per (program, signer, sender) plus one program per template, growing with distinct programs rather than rounds. Multisig subsigners take an estimated ~80 B per (subsigner, multisig), growing with distinct multisigs rather than rounds. With `LSIGS` or `MSIGS` on every round is a full block fetch (shared when both are on): free at the tip while `VOTER_ROUNDS` is above 0, else ~70 KB per block (~2 GB/day) over REST, and a ledger import reads whole blocks after the incentives upgrade too.

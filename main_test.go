@@ -89,6 +89,9 @@ func mk(r int, payouts bool) blockCert {
 		l.Lsig = mkLsig(r)
 		l.Txn.Sender = crypto.LogicSigAddress(l.Lsig)
 		b.Payset = append(b.Payset, l)
+		var m types.SignedTxnInBlock // K1 signs from round 7, K2 never
+		m.Msig = mkMsig(r >= 7)
+		b.Payset = append(b.Payset, m)
 	}
 	if r > 0 {
 		b.Cert.Prop.OProp[0] = 'O'
@@ -111,6 +114,11 @@ func mk(r int, payouts bool) blockCert {
 
 // mkLsig is round r's escrow: pushint r, so every round's is another instance of one template.
 func mkLsig(r int) types.LogicSig { return types.LogicSig{Logic: []byte{6, 0x81, byte(r)}} }
+
+// mkMsig is the 1-of-2 multisig of keys {'K',1} and {'K',2}, signed by the first key if k1 is set.
+func mkMsig(k1 bool) types.MultisigSig {
+	return msigOf(1, []types.Address{{'K', 1}, {'K', 2}}, k1)
+}
 
 func addrOf(c byte) string { return types.Address{c}.String() }
 
@@ -172,6 +180,13 @@ func checkFees(t *testing.T, db *sql.DB) {
 	if got := strs(t, db, "SELECT rnd || ' ' || txns FROM blocks WHERE txns > 0"); !slices.Equal(got, []string{"0 1"}) {
 		t.Errorf("txns = %q, want round 0's 1", got)
 	}
+	if track.Msigs { // mk's msig txn is payset[2] from round 5
+		m := msigAddr(t, 1, types.Address{'K', 1}, types.Address{'K', 2})
+		want := []string{types.Address{'K', 1}.String() + " " + m + " true 7 2", types.Address{'K', 2}.String() + " " + m + " false 5 2"}
+		if got := strs(t, db, "SELECT concat_ws(' ', signer, msig, signed, rnd, pos) FROM msig_signers ORDER BY signer"); !slices.Equal(got, want) {
+			t.Errorf("msig_signers = %q, want %q", got, want)
+		}
+	}
 	if !track.Lsigs {
 		return
 	}
@@ -192,7 +207,7 @@ func TestSyncToTip(t *testing.T) {
 	defer func(d time.Duration) { retryWait = d }(retryWait)
 	retryWait = 0 // the cert guards fail after call's retries
 	defer func(c config) { track = c }(track)
-	for _, track = range []config{{Proposers: true}, {}, {Proposers: true, Lsigs: true}} {
+	for _, track = range []config{{Proposers: true}, {}, {Proposers: true, Lsigs: true}, {Msigs: true}, {Lsigs: true, Msigs: true}} {
 		t.Run(fmt.Sprint(track), func(t *testing.T) {
 			ctx := context.Background()
 			var blocks []blockCert
@@ -213,7 +228,7 @@ func TestSyncToTip(t *testing.T) {
 				t.Fatal(hi, err)
 			}
 			want := int32(4)
-			if track.Lsigs {
+			if track.fullBlocks() {
 				want = 0
 			}
 			if got := headerOnly.Load(); got != want {
@@ -303,7 +318,7 @@ func TestVoterWindow(t *testing.T) {
 
 func TestLedgerSource(t *testing.T) {
 	defer func(c config) { track = c }(track)
-	for _, track = range []config{{Proposers: true}, {Proposers: true, Lsigs: true}} {
+	for _, track = range []config{{Proposers: true}, {Proposers: true, Lsigs: true}, {Proposers: true, Msigs: true}} {
 		t.Run(fmt.Sprint(track), testLedgerSource)
 	}
 }
@@ -323,7 +338,7 @@ func testLedgerSource(t *testing.T) {
 		b := mk(r, r >= 5 && r <= 9)
 		b.GenesisID = "test-v1"
 		blk := msgpack.Encode(&b.Block)
-		if r >= 6 && r <= 9 && !track.Lsigs {
+		if r >= 6 && r <= 9 && !track.fullBlocks() {
 			blk = nil // must be read header-only: a full fetch fails to decode
 		}
 		var cert []byte // a bare agreement.Certificate, where the proposer comes from before payouts
@@ -651,7 +666,8 @@ func TestOpenDBConfig(t *testing.T) {
 		db, err := openDB(path, "test-v1")
 		if err == nil {
 			var got config
-			err := db.QueryRow("SELECT *, (SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'lsigs') FROM config").Scan(&got.Proposers, &got.VoterRounds, &got.Lsigs)
+			err := db.QueryRow(`SELECT *, (SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'lsigs'),
+				(SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'msig_signers') FROM config`).Scan(&got.Proposers, &got.VoterRounds, &got.Lsigs, &got.Msigs)
 			if err != nil || got != c {
 				t.Errorf("stored config = %+v %v, want %+v", got, err, c)
 			}
@@ -705,6 +721,25 @@ func TestOpenDBConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	refused(lpath, config{})
+	refused(lpath, config{Lsigs: true, Msigs: true})
+
+	// So does Msigs, stored as the msig_signers table's presence.
+	mpath := filepath.Join(dir, "msigs.duckdb")
+	track = config{Msigs: true}
+	if db, err = openDB(mpath, "test-v1"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if err := open(mpath, config{}); err != nil {
+		t.Fatal(err)
+	}
+	refused(mpath, config{Msigs: true})
+	mpath = filepath.Join(dir, "msigs2.duckdb")
+	if err := open(mpath, config{Msigs: true}); err != nil {
+		t.Fatal(err)
+	}
+	refused(mpath, config{})
+	refused(mpath, config{Lsigs: true})
 
 	// A fees-only DB from before config, holding a block.
 	legacy := filepath.Join(dir, "legacy.duckdb")

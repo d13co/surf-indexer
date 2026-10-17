@@ -46,6 +46,7 @@ type block struct {
 	pp             uint64
 	absent, voters []string
 	lsigs          []lsigUse
+	msigs          []msigUse
 }
 
 // config is what a DB tracks besides fees. It is fixed once the DB holds a block.
@@ -53,10 +54,11 @@ type config struct {
 	Proposers   bool   // proposer, payout and absent accounts per block
 	VoterRounds uint64 // cert voters of the last VoterRounds rounds; 0: none
 	Lsigs       bool   // lsig programs, delegators, rekeyed senders and templates (lsigs, lsig_templates)
+	Msigs       bool   // multisig subsigners (msig_signers)
 }
 
 // fullBlocks is whether every round needs its payset.
-func (c config) fullBlocks() bool { return c.Lsigs }
+func (c config) fullBlocks() bool { return c.Lsigs || c.Msigs }
 
 // lsigTables are kept out of schema: the presence of lsigs is the stored Lsigs flag, which an older
 // binary ignores (a config column would break its INSERT INTO config), though its ingest leaves a gap.
@@ -74,6 +76,16 @@ const lsigTables = `CREATE TABLE IF NOT EXISTS lsigs(
 CREATE TABLE IF NOT EXISTS lsig_templates(
 	tmpl  VARCHAR NOT NULL,
 	logic VARCHAR NOT NULL -- base64 program of the first instance seen (duckdb-go binds no BLOB in a list)
+)`
+
+// msigTable is kept out of schema for the same reason as lsigTables: its presence is the stored Msigs flag.
+// A row points at one txn: the first that the signer signed, or while it never has, the first seen.
+const msigTable = `CREATE TABLE IF NOT EXISTS msig_signers(
+	signer VARCHAR  NOT NULL, -- subsigner address (its pk)
+	msig   VARCHAR  NOT NULL, -- multisig address from the preimage: the txn's authorizer, not always its sender
+	signed BOOLEAN  NOT NULL, -- ever signed (a txn, or a delegated lsig: before v41 a sig on the program only)
+	rnd    UINTEGER NOT NULL, -- the txn's round
+	pos    UINTEGER NOT NULL  -- its index in that block's payset (top-level txns)
 )`
 
 var track config // from env at startup; openDB refuses a DB synced with another
@@ -125,14 +137,17 @@ func setup(db *sql.DB, path, genesisID string) error {
 		err = tx.QueryRow("SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'lsigs'").Scan(&have.Lsigs)
 	}
 	if err == nil {
+		err = tx.QueryRow("SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'msig_signers'").Scan(&have.Msigs)
+	}
+	if err == nil {
 		err = tx.QueryRow("SELECT count(*) > 0 FROM blocks").Scan(&hasBlocks)
 	}
 	if err != nil {
 		return err
 	}
 	if hasBlocks && have != track {
-		return fmt.Errorf("%s was synced with PROPOSERS=%t VOTER_ROUNDS=%d LSIGS=%t: run with those, or rebuild into a new file (LEDGER_DB) to change them",
-			path, have.Proposers, have.VoterRounds, have.Lsigs)
+		return fmt.Errorf("%s was synced with PROPOSERS=%t VOTER_ROUNDS=%d LSIGS=%t MSIGS=%t: run with those, or rebuild into a new file (LEDGER_DB) to change them",
+			path, have.Proposers, have.VoterRounds, have.Lsigs, have.Msigs)
 	}
 	if legacy {
 		if _, err = tx.Exec("ALTER TABLE blocks ADD COLUMN prop VARCHAR"); err == nil {
@@ -146,6 +161,11 @@ func setup(db *sql.DB, path, genesisID string) error {
 		_, err = tx.Exec(lsigTables)
 	} else if err == nil {
 		_, err = tx.Exec("DROP TABLE IF EXISTS lsigs; DROP TABLE IF EXISTS lsig_templates")
+	}
+	if err == nil && track.Msigs {
+		_, err = tx.Exec(msigTable)
+	} else if err == nil {
+		_, err = tx.Exec("DROP TABLE IF EXISTS msig_signers")
 	}
 	if err == nil {
 		_, err = tx.Exec("DELETE FROM config")
@@ -202,6 +222,9 @@ func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
 	if err == nil && track.Lsigs {
 		err = mergeLsigs(ctx, tx, rows)
 	}
+	if err == nil && track.Msigs {
+		err = mergeMsigs(ctx, tx, rows)
+	}
 	// Rows are in rnd order, so whole row groups empty out and are reclaimed at checkpoint.
 	if last := rows[len(rows)-1].Rnd; err == nil && track.VoterRounds > 0 && last >= track.VoterRounds {
 		_, err = tx.ExecContext(ctx, "DELETE FROM voters WHERE rnd <= ?", last-track.VoterRounds)
@@ -250,6 +273,40 @@ func mergeLsigs(ctx context.Context, tx *sql.Tx, rows []block) error {
 		_, err = tx.ExecContext(ctx, `INSERT INTO lsig_templates SELECT * FROM (SELECT unnest($1) AS tmpl, unnest($2) AS logic) s
 			WHERE NOT EXISTS (SELECT 1 FROM lsig_templates t WHERE t.tmpl = s.tmpl)`, ttmpl, tlogic)
 	}
+	return err
+}
+
+// mergeMsigs folds rows' multisig uses into msig_signers, deduped here for MERGE as in mergeLsigs.
+// A pair keeps its first use until its first signed one, which then sticks. MERGE keeps the better
+// pointer either way (signed, then earlier), so it holds even if batches arrive out of order.
+func mergeMsigs(ctx context.Context, tx *sql.Tx, rows []block) error {
+	var signer, msig []string
+	var signed []bool
+	var rnd, pos []uint64
+	seen := map[[2]string]int{}
+	for _, r := range rows { // in rnd order, and uses in payset order
+		for _, u := range r.msigs {
+			k := [2]string{u.signer, u.msig}
+			i, ok := seen[k]
+			if !ok {
+				i, seen[k] = len(signer), len(signer)
+				signer, msig, signed = append(signer, u.signer), append(msig, u.msig), append(signed, u.signed)
+				rnd, pos = append(rnd, r.Rnd), append(pos, uint64(u.pos))
+			} else if u.signed && !signed[i] {
+				signed[i], rnd[i], pos[i] = true, r.Rnd, uint64(u.pos)
+			}
+		}
+	}
+	if len(signer) == 0 { // an empty list binds as SQLNULL[]
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `MERGE INTO msig_signers t
+		USING (SELECT unnest($1) AS signer, unnest($2) AS msig, unnest($3) AS signed, unnest($4) AS rnd, unnest($5) AS pos) s
+		ON t.signer = s.signer AND t.msig = s.msig
+		WHEN MATCHED AND (s.signed AND NOT t.signed OR s.signed = t.signed AND (s.rnd, s.pos) < (t.rnd, t.pos))
+			THEN UPDATE SET signed = s.signed, rnd = s.rnd, pos = s.pos
+		WHEN NOT MATCHED THEN INSERT VALUES (s.signer, s.msig, s.signed, s.rnd, s.pos)`,
+		signer, msig, signed, rnd, pos)
 	return err
 }
 

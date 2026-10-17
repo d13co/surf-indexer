@@ -169,6 +169,9 @@ func fetchBlock(ctx context.Context, src source, rnd uint64, voters bool) (block
 	if track.Lsigs {
 		blk.lsigs = lsigUses(b.Block)
 	}
+	if track.Msigs {
+		blk.msigs = msigUses(b.Block)
+	}
 	return blk, nil
 }
 

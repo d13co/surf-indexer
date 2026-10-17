@@ -272,35 +272,35 @@ func routes(db *sql.DB) http.Handler {
 			FROM (SELECT voter, count(*) AS n FROM voters WHERE`+in+` GROUP BY voter)`)
 		ranged("GET /v0/voter/{addr}", `SELECT coalesce(to_json(list(rnd ORDER BY rnd))::VARCHAR, '[]') FROM voters WHERE voter = $3 AND`+in)
 	}
-	if track.Lsigs {
-		// limited serves q with ?limit as $1 and, for an {addr} or {id} pattern, that value as $2.
-		limited := func(pattern, q string) {
-			withAddr, withID := strings.Contains(pattern, "{addr}"), strings.Contains(pattern, "{id}")
-			mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
-				n, err := opt(r.URL.Query(), "limit", 1000, parseLimit)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
+	// limited serves q with ?limit as $1 and, for an {addr} or {id} pattern, that value as $2.
+	limited := func(pattern, q string) {
+		withAddr, withID := strings.Contains(pattern, "{addr}"), strings.Contains(pattern, "{id}")
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			n, err := opt(r.URL.Query(), "limit", 1000, parseLimit)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			args := []any{n}
+			switch {
+			case withAddr:
+				a, ok := addr(w, r)
+				if !ok {
 					return
 				}
-				args := []any{n}
-				switch {
-				case withAddr:
-					a, ok := addr(w, r)
-					if !ok {
-						return
-					}
-					args = append(args, a)
-				case withID:
-					id := r.PathValue("id")
-					if len(id) != 16 || strings.Trim(id, "0123456789abcdef") != "" {
-						http.Error(w, "id: want 16 lowercase hex digits", http.StatusBadRequest)
-						return
-					}
-					args = append(args, id)
+				args = append(args, a)
+			case withID:
+				id := r.PathValue("id")
+				if len(id) != 16 || strings.Trim(id, "0123456789abcdef") != "" {
+					http.Error(w, "id: want 16 lowercase hex digits", http.StatusBadRequest)
+					return
 				}
-				replySQL(w, r, db, q, args...)
-			})
-		}
+				args = append(args, id)
+			}
+			replySQL(w, r, db, q, args...)
+		})
+	}
+	if track.Lsigs {
 		// uses lists the newest $1 rows matching where; NULL if none. '' stands for NULL in signer/sender.
 		uses := func(where string) string {
 			const newest = " ORDER BY last_rnd DESC, prog, signer, sender"
@@ -322,6 +322,17 @@ func routes(db *sql.DB) http.Handler {
 		limited("GET /v0/template/{id}", `SELECT to_json({'template': tmpl, 'logic': logic,
 			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = $2), 'uses': `+uses("tmpl = $2")+`})::VARCHAR
 			FROM lsig_templates WHERE tmpl = $2`)
+	}
+	if track.Msigs {
+		// A row's round and index point at one txn: payset[index] of that block, the first the signer
+		// signed, or while it never has, the first seen. Newest first.
+		// ponytail: no index, so each request scans msig_signers (ms at ~1M rows); add one if it gets big.
+		limited("GET /v0/subsigner/{addr}", `SELECT coalesce(to_json(list({'msig': msig, 'signed': signed, 'round': rnd, 'index': pos}
+			ORDER BY rnd DESC, pos DESC, msig))::VARCHAR, '[]')
+			FROM (SELECT * FROM msig_signers WHERE signer = $2 ORDER BY rnd DESC, pos DESC, msig LIMIT $1)`)
+		limited("GET /v0/msig/{addr}", `SELECT coalesce(to_json(list({'signer': signer, 'signed': signed, 'round': rnd, 'index': pos}
+			ORDER BY rnd DESC, pos DESC, signer))::VARCHAR, '[]')
+			FROM (SELECT * FROM msig_signers WHERE msig = $2 ORDER BY rnd DESC, pos DESC, signer LIMIT $1)`)
 	}
 	if track.Proposers || track.VoterRounds > 0 {
 		mux.HandleFunc("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
