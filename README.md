@@ -33,7 +33,7 @@ sudo apt update && sudo apt install surf-indexer
 The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`):
 
 ```
-sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=..., PORT=..., ADMIN_TOKEN=...
+sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=..., PORT=..., ADMIN_TOKEN=..., REAL_IP_HEADER=... behind a proxy
 sudo chmod 600 /etc/surf-indexer/mainnet-v1.0.env   # it holds tokens; systemd reads it as root
 sudo systemctl enable --now surf-indexer@mainnet-v1.0
 ```
@@ -84,6 +84,16 @@ It is safe to run beside a live algod: the DB is opened read-only, and WAL reade
 ## Routes
 
 All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC midnight) and RFC3339 are also accepted.
+
+### Rate limits
+
+Each client (IP address, an IPv6 one as its /64) gets `RATE_LIMIT` requests per second across all routes, in bursts of up to 5× that (default 10/s, burst 50). Heavy requests also take one of 30 per minute, in bursts of up to 10. Heavy are `/v0/series`, `/v0/fees` (not `/v0/fees/<period>`), `/v0/templates`, and any [proposer or voter](#proposers-and-voters) route taking a round range (`/v0/proposers`, `/v0/proposer/<address>` and its `/stats`, `/v0/payouts/highest`, `/v0/evictions` and `/v0/evictions/<address>`, `/v0/voters`, `/v0/voter/<address>`) when that range, up to the tip, covers 5M rounds (~6 months) or more: by default it is all of history. Over either limit, a request gets **429** with `Retry-After` (seconds). `RATE_LIMIT=0` turns these off.
+
+At most `HEAVY_CONCURRENCY` heavy requests query at once across all clients (default 4); each frees its turn once its query is done, before its reply is sent. One that waits 10 s for a turn gets **503** with `Retry-After`. Every request has 30 s: a query still running then is interrupted and gets **503**. A response must be sent within 2 minutes of the request.
+
+Every response, 429s and 503s included, carries `Access-Control-Allow-Origin: *` and exposes `Retry-After` and `X-Truncated` to browsers.
+
+Behind a proxy every client shares the proxy's address, so set `REAL_IP_HEADER` to the header holding the visitor's IP, e.g. `CF-Connecting-IP` behind a Cloudflare Tunnel. It is read only from a loopback or private peer (cloudflared on the host, in docker or on the LAN), so a client reaching the port directly can't choose its own. A request from such a peer without a valid value is limited by the peer address, with a warning logged once. With Cloudflare, keep the zone's *Remove visitor IP headers* Managed Transform and *Pseudo IPv4* off: the first strips the header, the second puts a made-up IPv4 in it for IPv6 visitors.
 
 ### Status
 
@@ -148,6 +158,8 @@ Fees and TPS per interval, for charts. `interval` is `block`, `minute`, `hour`, 
 With `interval=block` each bucket is one block: `ts` is its timestamp and `tps` is `txns` / the seconds since the previous block (0 if none or equal timestamps).
 
 Buckets with no blocks are omitted. A bucket cut by `start`, `end` or the chain tip is partial, and its `tps` is still divided by the full bucket length.
+
+At most 10000 buckets are returned, the oldest first. When more were left out the response has the header `X-Truncated: 10000`: continue from the last bucket's end, or use a coarser interval. On a chain with long gaps between blocks (a private net) it can come with fewer buckets.
 
 ### Upgrades
 
@@ -250,7 +262,7 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 
 `/v0/delegations/<address>`: uses where the address is the `signer` or the `sender`: the lsigs it delegated, and those that moved it while rekeyed. `[]` if none.
 
-`/v0/templates`: templates with 2 or more programs, or delegated by 2 or more accounts, most programs first: `[{"template":"…","programs":1234,"delegators":0,"txns":56789,"firstRound":…,"lastRound":…}, ...]`. `delegators` counts the distinct signers.
+`/v0/templates`: templates with 2 or more programs, or delegated by 2 or more accounts, most programs first: `[{"template":"…","programs":1234,"delegators":0,"txns":56789,"firstRound":…,"lastRound":…}, ...]`. `delegators` counts the distinct signers. The list is cached for up to a minute (a smaller `limit` is its first rows); an [admin](#admin) rename clears the cache.
 
 `/v0/template/<id>`: `{"template":"…","name":null,"logic":"<base64>","programs":1234,"uses":[…]}`, or 404. `logic` is the first program seen of the template (disassemble it with `goal clerk compile -D`). `id` is 16 lowercase hex digits.
 
@@ -305,6 +317,9 @@ A multisig preimage this build can't read (a new msig version, or a key that isn
 | LSIGS       | Store logic sig uses, delegators and templates                 | false            |
 | MSIGS       | Store multisig subsigners, whether each signed, and a txn      | false            |
 | ADMIN_TOKEN | Enables the [admin](#admin) routes (needs `LSIGS`); 16+ printable ASCII characters, no spaces, e.g. `openssl rand -hex 32` |                  |
+| RATE_LIMIT  | Per-client requests/s across all routes, burst 5×; 0 for no per-client limits ([rate limits](#rate-limits)) | 10 |
+| HEAVY_CONCURRENCY | Heavy requests running at once, across all clients; 0 for no cap | 4 |
+| REAL_IP_HEADER | Header holding the visitor IP behind a proxy, read only from a loopback or private peer, e.g. `CF-Connecting-IP` |  |
 | START_ROUND | Trials only: an empty DB starts at this round ([bulk load](#bulk-load-from-an-archival-nodes-ledger)) | 0 |
 
 `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.

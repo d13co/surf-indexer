@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -193,6 +194,9 @@ func rounds(ctx context.Context, db *sql.DB) (n, lo, hi int64, err error) {
 // insertBatch appends rows, their evictions and voters in one transaction, so a batch lands whole
 // or not at all, then drops voters that fell out of the window.
 // List params + unnest is ~20x faster than a prepared INSERT per row.
+// storedTip is the last stored round, for sizing requests; set by openData and insertBatch.
+var storedTip atomic.Uint64
+
 func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
 	var rnd, ts, tc, fees, txns, pp, arnd, vrnd []uint64
 	var prop, absent, voters []string
@@ -237,7 +241,10 @@ func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err == nil {
+		storedTip.Store(rows[len(rows)-1].Rnd)
+	}
+	return err
 }
 
 // mergeLsigs folds rows' lsig uses into lsigs, and stores the first program seen of each new template.
@@ -425,35 +432,88 @@ const qSeries = `WITH h AS (
 	SELECT t, fees, blocks, hi - coalesce(lag(hi) OVER (ORDER BY t),
 		(SELECT tc FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1), lo) + n AS txns FROM b
 )
-SELECT epoch(t)::BIGINT, fees, txns, txns / (epoch(t + ?::INTERVAL) - epoch(t)), blocks, NULL FROM d ORDER BY t`
+SELECT epoch(t)::BIGINT, fees, txns, txns / (epoch(t + ?::INTERVAL) - epoch(t)), blocks, NULL FROM d ORDER BY t LIMIT ?`
 
-// qBlocks returns blocks with ts in [start, end) as one-block buckets. The last block before start
-// rides along so lag gives the first block its txns and duration; genesis has neither, so 0, and
-// a zero duration gives tps 0. A block from before tc existed adds its own txns, as in qSeries.
-const qBlocks = `WITH b AS (
-	(SELECT rnd, ts, tc, fees, txns AS n FROM blocks WHERE ts < ?::UINTEGER ORDER BY ts DESC, rnd DESC LIMIT 1)
-	UNION ALL
-	SELECT rnd, ts, tc, fees, txns FROM blocks WHERE ts >= ?::UINTEGER AND ts < ?::UINTEGER
-), d AS (
+// bucketLen is each fixed interval's length in seconds and its boundaries' offset from the epoch
+// (1970-01-05 was a Monday). Month has none: 10000 months is 800+ years.
+var bucketLen = map[string][2]int64{"minute": {60, 0}, "hour": {3600, 0}, "day": {86400, 0}, "week": {7 * 86400, 4 * 86400}}
+
+// seriesWindows caps the bounded queries one fixed-interval series makes. Each skips the gap
+// before its first block, so more are needed only on a chain this sparse (a private net). A var for tests.
+var seriesWindows = 4
+
+// qBlocks returns the blocks of rounds [$1, $2] with ts in [$3, $4) as one-block buckets. $1 is the
+// round before start's first, riding along so lag gives that block its txns and duration; genesis
+// has neither, so 0, and a zero duration gives tps 0. A block from before tc existed adds its own
+// txns, as in qSeries. ts never decreases with rnd, so ordering by rnd is ordering by ts.
+const qBlocks = `WITH d AS (
 	SELECT rnd, ts, fees, tc - lag(tc, 1, tc) OVER w + n AS txns, ts - lag(ts, 1, ts) OVER w AS dt
-	FROM b WINDOW w AS (ORDER BY ts, rnd)
+	FROM (SELECT rnd, ts, tc, fees, txns AS n FROM blocks WHERE rnd BETWEEN ?::UINTEGER AND ?::UINTEGER) WINDOW w AS (ORDER BY rnd)
 )
 SELECT ts::BIGINT, fees, txns, coalesce(txns / nullif(dt, 0), 0), 1::UBIGINT, rnd FROM d
-WHERE ts >= ?::UINTEGER ORDER BY ts, rnd`
+WHERE ts >= ?::UINTEGER AND ts < ?::UINTEGER ORDER BY rnd`
 
-// series buckets blocks with ts in [start, end) by interval, a key of intervals.
-func series(ctx context.Context, db *sql.DB, interval string, start, end uint64) ([]bucket, error) {
-	iv := intervals[interval]
-	q, args := qSeries, []any{iv.grain, iv.grain, start, end, iv.iv, start, iv.iv}
+// maxBuckets caps a series: a year of blocks was ~1 GB of JSON. A var for tests.
+var maxBuckets = 10000
+
+// series buckets blocks with ts in [start, end) by interval, a key of intervals: the first maxBuckets,
+// truncated if there were more. Each query's scan is bounded too, not just its reply: the window
+// and grouping would otherwise read every block in [start, end) first (all blocks: 27 s, 3.4 GB).
+func series(ctx context.Context, db *sql.DB, interval string, start, end uint64) ([]bucket, bool, error) {
+	out := []bucket{}
 	if interval == "block" {
-		q, args = qBlocks, []any{start, start, end, start}
+		// Every round is a block and ts never decreases with rnd, so the first maxBuckets+1 are the
+		// rounds from the first at or after start.
+		first, err := blockAt(ctx, db, start, "after")
+		if err != nil || first == nil || first.Ts >= end {
+			return out, false, err
+		}
+		if out, err = scanBuckets(ctx, db, out, qBlocks, max(first.Rnd, 1)-1, first.Rnd+uint64(maxBuckets), start, end); err != nil {
+			return nil, false, err
+		}
+		if len(out) > maxBuckets {
+			return out[:maxBuckets], true, nil
+		}
+		return out, false, nil
 	}
+	iv := intervals[interval]
+	l, fixed := bucketLen[interval]
+	for range seriesWindows {
+		// A fixed interval's window ends maxBuckets+1 buckets after its first block's.
+		cut := end
+		if fixed {
+			first, err := blockAt(ctx, db, start, "after")
+			if err != nil || first == nil || first.Ts >= end {
+				return out, false, err
+			}
+			n, off := l[0], l[1]
+			b0 := int64(first.Ts) - ((int64(first.Ts)-off)%n+n)%n
+			cut = uint64(min(int64(end), b0+int64(maxBuckets+1-len(out))*n))
+		}
+		var err error
+		if out, err = scanBuckets(ctx, db, out, qSeries, iv.grain, iv.grain, start, cut, iv.iv, start, iv.iv, maxBuckets+1-len(out)); err != nil {
+			return nil, false, err
+		}
+		if len(out) > maxBuckets {
+			return out[:maxBuckets], true, nil
+		}
+		if cut >= end {
+			return out, false, nil
+		}
+		start = cut // the next window's first bucket txns are the tc delta from this one's last block
+	}
+	// Out of windows with blocks left: truncated, though short.
+	next, err := blockAt(ctx, db, start, "after")
+	return out, err == nil && next != nil && next.Ts < end, err
+}
+
+// scanBuckets appends q's rows to out.
+func scanBuckets(ctx context.Context, db *sql.DB, out []bucket, q string, args ...any) ([]bucket, error) {
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []bucket{}
 	for rows.Next() {
 		var b bucket
 		if err := rows.Scan(&b.Ts, &b.Fees, &b.Txns, &b.Tps, &b.Blocks, &b.Rnd); err != nil {

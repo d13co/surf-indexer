@@ -7,6 +7,7 @@ require (
 	github.com/duckdb/duckdb-go/v2 v2.10506.0
 	github.com/mattn/go-sqlite3 v1.14.52
 	golang.org/x/sync v0.23.0
+	golang.org/x/time v0.12.0
 )
 
 require (

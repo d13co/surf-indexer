@@ -78,7 +78,8 @@ func templateName(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return name, true
 }
 
-func adminRoutes(mux *http.ServeMux, db *sql.DB) {
+// adminRoutes registers the admin routes. onChange runs after each edit, to drop cached replies.
+func adminRoutes(mux *http.ServeMux, db *sql.DB, onChange func()) {
 	// Names a template seen by ingest (404 otherwise, which catches a mistyped id), replacing any name.
 	mux.HandleFunc("PUT /v0/admin/template/{id}", authorized(func(w http.ResponseWriter, r *http.Request) {
 		id, ok := tmplID(w, r)
@@ -100,9 +101,10 @@ func adminRoutes(mux *http.ServeMux, db *sql.DB) {
 			return
 		}
 		if err == nil {
+			onChange()
 			slog.Info("template named", "template", id, "name", name, "remote", r.RemoteAddr)
 		}
-		reply(w, map[string]string{"template": id, "name": name}, err)
+		reply(w, r, map[string]string{"template": id, "name": name}, err)
 	}))
 
 	// Removes a template's name. Idempotent: 204 whether or not it had one.
@@ -112,9 +114,10 @@ func adminRoutes(mux *http.ServeMux, db *sql.DB) {
 			return
 		}
 		if _, err := db.ExecContext(r.Context(), "DELETE FROM template_names WHERE tmpl = $1", id); err != nil {
-			reply(w, nil, err)
+			reply(w, r, nil, err)
 			return
 		}
+		onChange()
 		slog.Info("template unnamed", "template", id, "remote", r.RemoteAddr)
 		w.WriteHeader(http.StatusNoContent)
 	}))

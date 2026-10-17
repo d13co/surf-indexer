@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -33,12 +34,27 @@ func parseTime(s string) (uint64, error) {
 
 func parseRound(s string) (uint64, error) { return strconv.ParseUint(s, 10, 32) }
 
+const maxLimit = 100000
+
 func parseLimit(s string) (uint64, error) {
 	n, err := strconv.ParseUint(s, 10, 32)
-	if err == nil && (n < 1 || n > 100000) {
+	if err == nil && (n < 1 || n > maxLimit) {
 		err = errors.New("want 1 to 100000")
 	}
 	return n, err
+}
+
+// firstN returns the JSON array s cut to its first n elements, each as it was.
+func firstN(s string, n uint64) (string, error) {
+	var list []json.RawMessage
+	if err := json.Unmarshal([]byte(s), &list); err != nil || uint64(len(list)) <= n {
+		return s, err
+	}
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = string(list[i])
+	}
+	return "[" + strings.Join(parts, ",") + "]", nil
 }
 
 // opt parses q[name], or returns def if it is absent.
@@ -53,32 +69,56 @@ func opt(q url.Values, name string, def uint64, parse func(string) (uint64, erro
 	return def, nil
 }
 
-func reply(w http.ResponseWriter, v any, err error) {
-	if err != nil {
+// fail replies to a request whose query failed: 503 if it ran out of time (DuckDB was interrupted,
+// so err needn't say why), nothing if the client left, else 500.
+func fail(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(r.Context().Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded):
+		slog.Warn("query timed out", "path", r.URL.Path, "query", r.URL.RawQuery)
+		retryLater(w, http.StatusServiceUnavailable, 5*time.Second)
+	case r.Context().Err() != nil:
+	default:
 		slog.Error("reply", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+
+func reply(w http.ResponseWriter, r *http.Request, v any, err error) {
+	queried(r)
+	if err != nil {
+		fail(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
 }
 
-// replySQL writes q's single JSON value, built by DuckDB as to_json(...)::VARCHAR (uncast, the
-// driver would unmarshal it). No row is a 404. q takes $n params: a repeated $1 binds one arg.
-func replySQL(w http.ResponseWriter, r *http.Request, db *sql.DB, q string, args ...any) {
+// querySQL returns q's single JSON value, built by DuckDB as to_json(...)::VARCHAR (uncast, the
+// driver would unmarshal it). q takes $n params: a repeated $1 binds one arg.
+func querySQL(ctx context.Context, db *sql.DB, q string, args ...any) (string, error) {
 	var s string
-	err := db.QueryRowContext(r.Context(), q, args...).Scan(&s)
+	err := db.QueryRowContext(ctx, q, args...).Scan(&s)
+	return s, err
+}
+
+// replyJSON writes a querySQL result. No row is a 404.
+func replyJSON(w http.ResponseWriter, r *http.Request, s string, err error) {
+	queried(r)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 	if err != nil {
-		slog.Error("reply", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		fail(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	io.WriteString(w, s)
+}
+
+func replySQL(w http.ResponseWriter, r *http.Request, db *sql.DB, q string, args ...any) {
+	s, err := querySQL(r.Context(), db, q, args...)
+	replyJSON(w, r, s, err)
 }
 
 // roundRange parses minRound/maxRound and narrows them by the time window [start, end). ts never
@@ -106,7 +146,7 @@ func roundRange(w http.ResponseWriter, r *http.Request, db *sql.DB) (lo, hi uint
 		last, err = blockAt(r.Context(), db, end-1, "before")
 	}
 	if err != nil {
-		reply(w, nil, err)
+		reply(w, r, nil, err)
 		return 0, 0, false
 	}
 	if first == nil || last == nil {
@@ -135,15 +175,24 @@ func tmplID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return id, true
 }
 
+// heavyRounds is the round range from which a ranged route is heavy: ~6 months. Over it a
+// proposer's stats take ~13 ms, over all of history ~150 ms.
+const heavyRounds = 5_000_000
+
 var periods = map[string]time.Duration{"24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour, "30d": 30 * 24 * time.Hour}
 
 func routes(db *sql.DB) http.Handler {
 	mux := http.NewServeMux()
+	lim := newLimiter(limits)
+	// light registers a cheap route; heavy one that scans or returns a lot, which also takes a heavy
+	// token and one of the global heavy slots.
+	light := func(pattern string, h http.HandlerFunc) { mux.HandleFunc(pattern, h) }
+	heavy := func(pattern string, h http.HandlerFunc) { mux.HandleFunc(pattern, lim.heavy(h)) }
 
-	mux.HandleFunc("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
+	light("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
 		n, _, hi, err := rounds(r.Context(), db)
 		// The config says which feature routes exist: those off are 404s.
-		reply(w, struct {
+		reply(w, r, struct {
 			OK       int   `json:"ok"`
 			MaxRound int64 `json:"maxRound"`
 			Records  int64 `json:"records"`
@@ -151,7 +200,7 @@ func routes(db *sql.DB) http.Handler {
 		}{1, hi, n, track}, err)
 	})
 
-	mux.HandleFunc("GET /v0/block", func(w http.ResponseWriter, r *http.Request) {
+	light("GET /v0/block", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		var b *block
 		var err error
@@ -181,10 +230,10 @@ func routes(db *sql.DB) http.Handler {
 			http.Error(w, "no such block", http.StatusNotFound)
 			return
 		}
-		reply(w, b, err)
+		reply(w, r, b, err)
 	})
 
-	mux.HandleFunc("GET /v0/fees", func(w http.ResponseWriter, r *http.Request) {
+	heavy("GET /v0/fees", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		minRnd, e1 := opt(q, "minRound", 0, parseRound)
 		maxRnd, e2 := opt(q, "maxRound", math.MaxUint32, parseRound)
@@ -195,20 +244,20 @@ func routes(db *sql.DB) http.Handler {
 			return
 		}
 		s, err := sumFees(r.Context(), db, minRnd, maxRnd, start, end)
-		reply(w, s, err)
+		reply(w, r, s, err)
 	})
 
-	mux.HandleFunc("GET /v0/fees/{period}", func(w http.ResponseWriter, r *http.Request) {
+	light("GET /v0/fees/{period}", func(w http.ResponseWriter, r *http.Request) {
 		d, ok := periods[r.PathValue("period")]
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
 		s, err := sumFees(r.Context(), db, 0, math.MaxUint32, uint64(time.Now().Add(-d).Unix()), math.MaxUint32)
-		reply(w, s, err)
+		reply(w, r, s, err)
 	})
 
-	mux.HandleFunc("GET /v0/series", func(w http.ResponseWriter, r *http.Request) {
+	heavy("GET /v0/series", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		iv := cmp.Or(q.Get("interval"), "day")
 		var e0 error
@@ -221,16 +270,21 @@ func routes(db *sql.DB) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		s, err := series(r.Context(), db, iv, start, end)
-		reply(w, s, err)
+		s, truncated, err := series(r.Context(), db, iv, start, end)
+		if truncated {
+			w.Header().Set("X-Truncated", strconv.Itoa(maxBuckets))
+		}
+		reply(w, r, s, err)
 	})
 
-	mux.HandleFunc("GET /v0/upgrades", func(w http.ResponseWriter, r *http.Request) {
+	light("GET /v0/upgrades", func(w http.ResponseWriter, r *http.Request) {
 		u, err := queryUpgrades(r.Context(), db, "ORDER BY rnd")
-		reply(w, u, err)
+		reply(w, r, u, err)
 	})
 
 	// ranged serves q with the round range as $1, $2 and, for an {addr} pattern, the address as $3.
+	// Its cost is the rounds it scans, so a range of heavyRounds or more (by default all of history)
+	// is heavy; a recent window, like the explorer's timeframes, is not.
 	ranged := func(pattern, q string) {
 		withAddr := strings.Contains(pattern, "{addr}")
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +299,13 @@ func routes(db *sql.DB) http.Handler {
 					return
 				}
 				args = append(args, a)
+			}
+			if top := min(hi, storedTip.Load()); top >= lo && top-lo >= heavyRounds {
+				var release func()
+				if r, release, ok = lim.admit(w, r); !ok {
+					return
+				}
+				defer release()
 			}
 			replySQL(w, r, db, q, args...)
 		})
@@ -273,7 +334,7 @@ func routes(db *sql.DB) http.Handler {
 		ranged("GET /v0/evictions", `SELECT coalesce(to_json(list({'account': acct, 'evictions': n, 'rounds': rs} ORDER BY last DESC, acct))::VARCHAR, '[]')
 			FROM (SELECT acct, count(*) AS n, list(rnd ORDER BY rnd DESC) AS rs, max(rnd) AS last FROM evictions WHERE`+in+` GROUP BY acct)`)
 		ranged("GET /v0/evictions/{addr}", `SELECT coalesce(to_json(list(rnd ORDER BY rnd))::VARCHAR, '[]') FROM evictions WHERE acct = $3 AND`+in)
-		mux.HandleFunc("GET /v0/round/{rnd}", func(w http.ResponseWriter, r *http.Request) {
+		light("GET /v0/round/{rnd}", func(w http.ResponseWriter, r *http.Request) {
 			rnd, err := parseRound(r.PathValue("rnd"))
 			if err != nil {
 				http.Error(w, "rnd: "+err.Error(), http.StatusBadRequest)
@@ -289,9 +350,9 @@ func routes(db *sql.DB) http.Handler {
 		ranged("GET /v0/voter/{addr}", `SELECT coalesce(to_json(list(rnd ORDER BY rnd))::VARCHAR, '[]') FROM voters WHERE voter = $3 AND`+in)
 	}
 	// limited serves q with ?limit as $1 and, for an {addr} or {id} pattern, that value as $2.
-	limited := func(pattern, q string) {
+	limited := func(reg func(string, http.HandlerFunc), pattern, q string) {
 		withAddr, withID := strings.Contains(pattern, "{addr}"), strings.Contains(pattern, "{id}")
-		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		reg(pattern, func(w http.ResponseWriter, r *http.Request) {
 			n, err := opt(r.URL.Query(), "limit", 1000, parseLimit)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -326,36 +387,50 @@ func routes(db *sql.DB) http.Handler {
 		// Driven by the lsig's newest row, so one never seen has none: 404.
 		// name is the admin-set template name, or null.
 		const name = `(SELECT name FROM template_names n WHERE n.tmpl = `
-		limited("GET /v0/lsig/{addr}", `SELECT to_json({'template': tmpl, 'name': `+name+`l.tmpl),
+		limited(light, "GET /v0/lsig/{addr}", `SELECT to_json({'template': tmpl, 'name': `+name+`l.tmpl),
 			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = l.tmpl), 'uses': `+uses("prog = $2")+`})::VARCHAR
 			FROM (SELECT tmpl FROM lsigs WHERE prog = $2 ORDER BY last_rnd DESC LIMIT 1) l`)
-		limited("GET /v0/delegations/{addr}", `SELECT coalesce(to_json(`+uses("signer = $2 OR sender = $2")+`)::VARCHAR, '[]')`)
+		limited(light, "GET /v0/delegations/{addr}", `SELECT coalesce(to_json(`+uses("signer = $2 OR sender = $2")+`)::VARCHAR, '[]')`)
 		// Families of programs, and single programs delegated by several accounts.
-		// ponytail: groups every row per request (~0.7s at 3M rows); cache it if it gets hot.
-		limited("GET /v0/templates", `SELECT coalesce(to_json(list({'template': tmpl, 'name': `+name+`t.tmpl), 'programs': p, 'delegators': d, 'txns': n,
+		// Groups every row (~0.7s at 3M rows), and every visitor of algo.surf's /lsigs asks the same, so
+		// the whole list is cached and a smaller limit is its first rows: one entry, whatever the limits.
+		templates := newReplyCache(time.Minute)
+		qTemplates := `SELECT coalesce(to_json(list({'template': tmpl, 'name': ` + name + `t.tmpl), 'programs': p, 'delegators': d, 'txns': n,
 			'firstRound': f, 'lastRound': l} ORDER BY p DESC, tmpl))::VARCHAR, '[]')
 			FROM (SELECT tmpl, count(DISTINCT prog) AS p, count(DISTINCT signer) FILTER (WHERE signer <> '') AS d, sum(txns) AS n,
-				min(first_rnd) AS f, max(last_rnd) AS l FROM lsigs GROUP BY tmpl HAVING p >= 2 OR d >= 2 ORDER BY p DESC, tmpl LIMIT $1) t`)
-		limited("GET /v0/template/{id}", `SELECT to_json({'template': tmpl, 'name': `+name+`$2), 'logic': logic,
+				min(first_rnd) AS f, max(last_rnd) AS l FROM lsigs GROUP BY tmpl HAVING p >= 2 OR d >= 2 ORDER BY p DESC, tmpl LIMIT $1) t`
+		heavy("GET /v0/templates", func(w http.ResponseWriter, r *http.Request) {
+			n, err := opt(r.URL.Query(), "limit", 1000, parseLimit)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			s, err := templates.get(r.Context(), func(ctx context.Context) (string, error) { return querySQL(ctx, db, qTemplates, maxLimit) })
+			if err == nil {
+				s, err = firstN(s, n)
+			}
+			replyJSON(w, r, s, err)
+		})
+		limited(light, "GET /v0/template/{id}", `SELECT to_json({'template': tmpl, 'name': `+name+`$2), 'logic': logic,
 			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = $2), 'uses': `+uses("tmpl = $2")+`})::VARCHAR
 			FROM lsig_templates WHERE tmpl = $2`)
 		if adminToken != "" {
-			adminRoutes(mux, db)
+			adminRoutes(mux, db, templates.clear) // a rename shows at once
 		}
 	}
 	if track.Msigs {
 		// A row's round and index point at one txn: payset[index] of that block, the first the signer
 		// signed, or while it never has, the first seen. Newest first.
 		// ponytail: no index, so each request scans msig_signers (ms at ~1M rows); add one if it gets big.
-		limited("GET /v0/subsigner/{addr}", `SELECT coalesce(to_json(list({'msig': msig, 'signed': signed, 'round': rnd, 'index': pos}
+		limited(light, "GET /v0/subsigner/{addr}", `SELECT coalesce(to_json(list({'msig': msig, 'signed': signed, 'round': rnd, 'index': pos}
 			ORDER BY rnd DESC, pos DESC, msig))::VARCHAR, '[]')
 			FROM (SELECT * FROM msig_signers WHERE signer = $2 ORDER BY rnd DESC, pos DESC, msig LIMIT $1)`)
-		limited("GET /v0/msig/{addr}", `SELECT coalesce(to_json(list({'signer': signer, 'signed': signed, 'round': rnd, 'index': pos}
+		limited(light, "GET /v0/msig/{addr}", `SELECT coalesce(to_json(list({'signer': signer, 'signed': signed, 'round': rnd, 'index': pos}
 			ORDER BY rnd DESC, pos DESC, signer))::VARCHAR, '[]')
 			FROM (SELECT * FROM msig_signers WHERE msig = $2 ORDER BY rnd DESC, pos DESC, signer LIMIT $1)`)
 	}
 	if track.Proposers || track.VoterRounds > 0 {
-		mux.HandleFunc("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
+		light("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
 			if a, ok := addr(w, r); ok {
 				replySQL(w, r, db, `SELECT to_json({'exists': EXISTS (SELECT 1 FROM blocks WHERE prop = $1)
 					OR EXISTS (SELECT 1 FROM voters WHERE voter = $1)})::VARCHAR`, a)
@@ -364,11 +439,19 @@ func routes(db *sql.DB) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t, sw := time.Now(), &statusWriter{w, http.StatusOK}
+		t, sw, key := time.Now(), &statusWriter{w, http.StatusOK}, lim.clientKey(r)
+		// Set before any reply, 429s and 503s included, or browsers hide them from algo.surf.
 		sw.Header().Set("Access-Control-Allow-Origin", "*")
-		mux.ServeHTTP(sw, r)
+		sw.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Truncated")
+		if d, ok := lim.allow(key, false); !ok {
+			retryLater(sw, http.StatusTooManyRequests, d)
+		} else {
+			ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)
+			mux.ServeHTTP(sw, r.WithContext(ctx))
+			cancel()
+		}
 		slog.Info("request", "method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery, "status", sw.status,
-			"ms", float64(time.Since(t).Microseconds())/1000, "remote", r.RemoteAddr)
+			"ms", float64(time.Since(t).Microseconds())/1000, "remote", r.RemoteAddr, "client", key)
 	})
 }
 

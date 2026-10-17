@@ -56,6 +56,7 @@ func TestAdminRoutes(t *testing.T) {
 		{"PUT", "/v0/admin/template/" + t1, bearer, `{"nom":"x"}`, 400, ""},
 		{"PUT", "/v0/admin/template/" + t1, bearer, `nope`, 400, ""},
 		{"GET", "/v0/template/" + t1 + "?limit=1", "", "", ok, `{"template":"` + t1 + `","name":null,`},
+		{"GET", "/v0/templates", "", "", ok, `[{"template":"` + t1 + `","name":null,`}, // cached: a rename must clear it
 		{"PUT", "/v0/admin/template/" + t1, bearer, `{"name":" Escrow v1 "}`, ok, `{"name":"Escrow v1","template":"` + t1 + `"}`},
 		{"GET", "/v0/template/" + t1 + "?limit=1", "", "", ok, `{"template":"` + t1 + `","name":"Escrow v1",`},
 		{"PUT", "/v0/admin/template/" + t1, bearer, `{"name":"Escrow v2"}`, ok, `{"name":"Escrow v2","template":"` + t1 + `"}`},

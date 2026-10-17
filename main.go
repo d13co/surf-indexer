@@ -114,6 +114,8 @@ func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 	if n, lo, hi, err := rounds(ctx, db); err != nil || n > 0 && (lo != int64(startRound) || hi+1-lo != n) {
 		db.Close()
 		fatal("db not contiguous from START_ROUND", "startRound", startRound, "records", n, "minRound", lo, "maxRound", hi, "err", err)
+	} else {
+		storedTip.Store(uint64(max(hi, 0)))
 	}
 	return db
 }
@@ -163,6 +165,7 @@ func main() {
 	if err := checkAdminToken(adminToken, track.Lsigs); err != nil {
 		fatal("ADMIN_TOKEN: " + err.Error())
 	}
+	limits = limitConfig{Rate: envInt("RATE_LIMIT", 10, 0), Heavy: envInt("HEAVY_CONCURRENCY", 4, 0), RealIPHeader: os.Getenv("REAL_IP_HEADER")}
 	if startRound = uint64(envInt("START_ROUND", 0, 0)); startRound > math.MaxUint32 {
 		fatal("START_ROUND: expected < 2^32", "got", startRound)
 	}
@@ -172,7 +175,8 @@ func main() {
 
 	concurrency, chunk, ledger, port := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1), os.Getenv("LEDGER_DB"), envStr("PORT", "8118")
 	slog.Info("config", "version", version, "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", ledger, "port", port,
-		"proposers", track.Proposers, "voterRounds", track.VoterRounds, "lsigs", track.Lsigs, "msigs", track.Msigs, "startRound", startRound, "admin", adminToken != "")
+		"proposers", track.Proposers, "voterRounds", track.VoterRounds, "lsigs", track.Lsigs, "msigs", track.Msigs, "startRound", startRound, "admin", adminToken != "",
+		"rateLimit", limits.Rate, "heavyConcurrency", limits.Heavy, "realIPHeader", limits.RealIPHeader)
 	if ledger != "" {
 		importLedger(ctx, ledger, genesisID, dbID, concurrency, chunk)
 		return
@@ -205,7 +209,9 @@ func main() {
 	}()
 
 	// ErrorLog: net/http's own errors (e.g. handler panics) at ERROR, not the rerouted log package's INFO.
-	srv := &http.Server{Handler: routes(db), ReadHeaderTimeout: 5 * time.Second,
+	// WriteTimeout bounds a request from its headers to its last byte, so it must exceed a heavy
+	// request's slot wait plus query time (40 s), with room to send a large reply.
+	srv := &http.Server{Handler: routes(db), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute,
 		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelError)}
 	go func() {
 		slog.Info("listening", "addr", ln.Addr().String())

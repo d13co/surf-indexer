@@ -520,9 +520,32 @@ func TestSeries(t *testing.T) {
 		{"block", m + 3600, m + 4*3600, []bucket{blk(2, m+3600, 200, 6, 1), blk(3, m+3*3600, 300, 1, 7200)}},
 	} {
 		// got must be non-nil to encode as [], not null.
-		if got, err := series(ctx, db, c.interval, c.start, c.end); err != nil || got == nil || !reflect.DeepEqual(got, c.want) {
+		if got, _, err := series(ctx, db, c.interval, c.start, c.end); err != nil || got == nil || !reflect.DeepEqual(got, c.want) {
 			t.Errorf("series(%s, %d, %d) = %+v %v, want %+v", c.interval, c.start, c.end, got, err, c.want)
 		}
+	}
+
+	// Over maxBuckets: the first ones, truncated; at it, all of them.
+	defer func(n int) { maxBuckets = n }(maxBuckets)
+	maxBuckets = 2
+	for iv, first := range map[string]int64{"hour": m, "block": m + 3599} {
+		got, truncated, err := series(ctx, db, iv, m, math.MaxUint32)
+		if err != nil || !truncated || len(got) != 2 || got[0].Ts != first || got[1].Ts != m+3600 {
+			t.Errorf("series(%s) over maxBuckets = %+v %t %v, want the first 2, truncated", iv, got, truncated, err)
+		}
+	}
+	if got, truncated, err := series(ctx, db, "hour", m+3*3600, math.MaxUint32); err != nil || truncated || len(got) != 2 {
+		t.Errorf("series at maxBuckets = %+v %t %v, want 2, not truncated", got, truncated, err)
+	}
+	// The first window, from genesis, holds only it: the next skips the gap to round 1.
+	if got, truncated, err := series(ctx, db, "hour", 0, math.MaxUint32); err != nil || !truncated || len(got) != 2 || got[0].Ts != 0 || got[1].Ts != m {
+		t.Errorf("series over a gap = %+v %t %v, want genesis and m, truncated", got, truncated, err)
+	}
+	// Out of windows with blocks left: truncated, though short.
+	defer func(n int) { seriesWindows = n }(seriesWindows)
+	seriesWindows = 1
+	if got, truncated, err := series(ctx, db, "hour", 0, math.MaxUint32); err != nil || !truncated || len(got) != 1 || got[0].Ts != 0 {
+		t.Errorf("series out of windows = %+v %t %v, want genesis only, truncated", got, truncated, err)
 	}
 }
 
@@ -643,11 +666,11 @@ func TestSeriesBeforeTc(t *testing.T) {
 	if err := insertBatch(ctx, db, []block{pre(0, 0, 0), pre(1, 10, 2), pre(2, 20, 3), row(3, 30, 4, 0), row(4, 40, 5, 0)}); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := series(ctx, db, "day", 0, math.MaxUint32); err != nil || len(got) != 1 || got[0].Txns != 10 {
+	if got, _, err := series(ctx, db, "day", 0, math.MaxUint32); err != nil || len(got) != 1 || got[0].Txns != 10 {
 		t.Errorf("day = %+v %v, want 10 txns", got, err)
 	}
 	var txns []uint64
-	got, err := series(ctx, db, "block", 0, math.MaxUint32)
+	got, _, err := series(ctx, db, "block", 0, math.MaxUint32)
 	for _, b := range got {
 		txns = append(txns, b.Txns)
 	}
@@ -984,6 +1007,7 @@ func TestLsigRoutes(t *testing.T) {
 		// t2 is one program with one delegator: not listed.
 		{"/v0/templates", ok, `[{"template":"` + t1 + `","name":null,"programs":2,"delegators":0,"txns":3,"firstRound":1,"lastRound":2},` +
 			`{"template":"` + t3 + `","name":null,"programs":1,"delegators":2,"txns":2,"firstRound":4,"lastRound":4}]`},
+		{"/v0/templates?limit=1", ok, `[{"template":"` + t1 + `","name":null,"programs":2,"delegators":0,"txns":3,"firstRound":1,"lastRound":2}]`}, // from the cache
 		{"/v0/templates?limit=x", 400, ""},
 		{"/v0/templates?limit=100001", 400, ""},
 		{"/v0/template/" + t1, ok, `{"template":"` + t1 + `","name":null,"logic":"AQ==","programs":2,"uses":[` + uB + "," + uA + `]}`},
