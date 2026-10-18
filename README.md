@@ -224,7 +224,7 @@ Every route below that takes `minRound`/`maxRound` also takes `start`/`end`, as 
 
 `/v0/voter/<address>`: the rounds the address voted in, oldest first: `[65500001,65500002, ...]`.
 
-`/v0/exists/<address>`: `{"exists":true}` if the address proposed a stored block or voted in the window.
+`/v0/exists/<address>`: `{"exists":true}` if the address proposed a stored block, voted in the window or was ever evicted.
 
 #### Differences from block-proposers
 
@@ -238,7 +238,7 @@ Clients switching from block-proposers should expect:
 6. Routes switched off by `PROPOSERS=0` or `VOTER_ROUNDS=0` return 404.
 7. Deployment: the DB file isn't compatible and must be rebuilt. `VOTE_ROUNDS_THRESHOLD` is now `VOTER_ROUNDS`, and the window is the last N rounds rather than N+1. `SYNC_THRESHOLD` and `EMIT_SPEED_EVERY` are gone, `DB_CHUNKS` means blocks per batch (default 1000), and `ALGOD_HOST`/`ALGOD_PORT` default to `http://localhost` and `8080`.
 
-Unchanged: paths, JSON keys, `pp` omitted when 0, the stats shape, eviction ordering and `exists`. Added: `start`/`end` on every ranged route, and explicit oldest-first order where block-proposers relied on insertion order.
+Unchanged: paths, JSON keys, `pp` omitted when 0, the stats shape, eviction ordering. Changed: `exists` is also true for an account only ever evicted. Added: `start`/`end` on every ranged route, and explicit oldest-first order where block-proposers relied on insertion order.
 
 ### Logic sigs
 
@@ -258,7 +258,7 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 
 **Templates.** Many lsigs are one program filled in with other values (TMPL_ variables, per-user or pool escrows). A template id hashes the program with its constants and branch offsets left out, so such programs share it: constant blocks are dropped, and every int load (`intc*`, `pushint`) counts as one op and every bytes load (`bytec*`, `pushbytes`) as another, because goal's assembler merges equal values and orders blocks by use, so one source assembles differently per value. That also covers autosalting: from TEAL v13, goal adds a salt (an extra `intcblock` entry, or a trailing `intcblock`) to a program whose address would be an Ed25519 key, so salted and unsalted instances share a template. That is the same opcode sequence, while constants **and branch targets** may differ: anyone can fill a template with their own values, so never use it to judge a lsig genuine. A program that doesn't parse, or has a TEAL version newer than this build knows (13), is its own template. Template ids from a build that knows another version can differ, so a DB built with one should be rebuilt rather than ingested into by another.
 
-`/v0/lsig/<address>`: `{"template":"…","programs":1234,"uses":[…]}`, where `programs` counts the distinct programs of its template, or 404 if the lsig was never used.
+`/v0/lsig/<address>`: `{"template":"…","programs":1234,"uses":[…]}`, where `programs` counts the distinct programs of its template, or 404 if the lsig was never used. `programs` here and in `/v0/template/<id>` comes from the cached `/v0/templates` list, so it can lag ingest by up to a minute and briefly count fewer programs than `uses` shows.
 
 `/v0/delegations/<address>`: uses where the address is the `signer` or the `sender`: the lsigs it delegated, and those that moved it while rekeyed. `[]` if none.
 
@@ -300,6 +300,23 @@ Every multisig that authorized a top-level txn is indexed (inner txns have none)
 `/v0/msig/<address>`: the subsigners of a multisig, with `signer` in place of `msig`. `[]` if it was never used.
 
 A multisig preimage this build can't read (a new msig version, or a key that isn't 32 bytes) is skipped with an `msig skipped` warning in the log, leaving a gap: upgrade the binary and rebuild if that appears.
+
+### Account summary
+
+`/v0/account/<address>`: what each tracked feature knows of an address, in one request (~40–50 ms on mainnet), for a client to choose what to fetch next:
+
+```
+{"lsig":{"template":"…","name":null},"delegations":2,"multisigs":1,"signers":0,"proposed":true,"evicted":false,"voted":false}
+```
+
+- `lsig`: its template and name if it is a logic sig, else `null` (`LSIGS`)
+- `delegations`: the number of uses `/v0/delegations/<address>` lists, before its `limit` (`LSIGS`)
+- `multisigs`: the number of multisigs it is a subsigner of, as `/v0/subsigner/<address>` lists before its `limit` (`MSIGS`)
+- `signers`: the number of subsigners if it is a multisig, as `/v0/msig/<address>` lists before its `limit` (`MSIGS`)
+- `proposed`, `evicted`: whether it ever proposed a stored block or was evicted (`PROPOSERS`)
+- `voted`: whether it voted in the window (`VOTER_ROUNDS` above 0)
+
+Keys of features that are off are left out, and an address never seen gets zeros and `false`. With all four off the route 404s. Not ranged and never heavy.
 
 ## Environment Variables
 

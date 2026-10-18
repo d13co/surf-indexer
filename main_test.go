@@ -1012,6 +1012,8 @@ func TestLsigRoutes(t *testing.T) {
 		{"/v0/templates?limit=100001", 400, ""},
 		{"/v0/template/" + t1, ok, `{"template":"` + t1 + `","name":null,"logic":"AQ==","programs":2,"uses":[` + uB + "," + uA + `]}`},
 		{"/v0/template/" + t2 + "?limit=1", ok, `{"template":"` + t2 + `","name":null,"logic":"Ag==","programs":1,"uses":[` + uCE + `]}`},
+		// In the list for its 2 delegators, with 1 program.
+		{"/v0/template/" + t3, ok, `{"template":"` + t3 + `","name":null,"logic":"Aw==","programs":1,"uses":[` + use(F, t3, G, "", 1, 4, 4) + "," + use(F, t3, H, "", 1, 4, 4) + `]}`},
 		{"/v0/template/0000000000000000", 404, ""},
 		{"/v0/template/00000000000000A1", 400, ""},
 		{"/v0/template/a1", 400, ""},
@@ -1028,5 +1030,116 @@ func TestLsigRoutes(t *testing.T) {
 		if code, _ := get(url); code != 404 {
 			t.Errorf("%s with lsigs off = %d, want 404", url, code)
 		}
+	}
+}
+
+func TestAccountRoute(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	all := config{Proposers: true, VoterRounds: 100, Lsigs: true, Msigs: true}
+	track = all
+	ctx := context.Background()
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	A, B, C, D, E, M, N, P, V, X, U := addrOf(1), addrOf(2), addrOf(3), addrOf(4), addrOf(5), addrOf(6), addrOf(7), addrOf(8), addrOf(9), addrOf(10), addrOf(11)
+	const t1, t2 = "00000000000000a1", "00000000000000a2"
+	var h http.Handler
+	get := func(url string) (int, string) {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", url, nil))
+		return w.Code, strings.TrimSpace(w.Body.String())
+	}
+	// D delegated C (t2), also sending for E rekeyed to D. With no template of 2 or more programs,
+	// programs comes from an empty list.
+	b1 := row(1, 1, 0, 0)
+	b1.prop, b1.lsigs = P, []lsigUse{{C, D, "", t2, "Ag==", 1}, {C, D, E, t2, "", 1}}
+	if err := insertBatch(ctx, db, []block{b1}); err != nil {
+		t.Fatal(err)
+	}
+	h = routes(db)
+	if code, body := get("/v0/lsig/" + C + "?limit=1"); code != 200 || !strings.Contains(body, `"programs":1,`) {
+		t.Errorf("lsig with no big template = %d %s, want programs 1", code, body)
+	}
+	// A and B are escrows of t1; D and A are subsigners of M, D also of N; V voted, X was evicted.
+	b2 := row(2, 2, 0, 0)
+	b2.prop, b2.absent, b2.voters = P, []string{X}, []string{V}
+	b2.lsigs = []lsigUse{{A, "", "", t1, "AQ==", 1}, {B, "", "", t1, "", 1}}
+	b2.msigs = []msigUse{{D, M, true, 0}, {A, M, false, 0}, {D, N, true, 1}}
+	if err := insertBatch(ctx, db, []block{b2}); err != nil {
+		t.Fatal(err)
+	}
+	acct := func(lsig string, dele, msigs, signers int, prop, evict, vote bool) string {
+		return fmt.Sprintf(`{"lsig":%s,"delegations":%d,"multisigs":%d,"signers":%d,"proposed":%t,"evicted":%t,"voted":%t}`,
+			lsig, dele, msigs, signers, prop, evict, vote)
+	}
+	h = routes(db)
+	ok := http.StatusOK
+	for _, c := range []struct {
+		url  string
+		code int
+		want string
+	}{
+		{"/v0/account/" + A, ok, acct(`{"template":"`+t1+`","name":null}`, 0, 1, 0, false, false, false)},
+		{"/v0/account/" + C, ok, acct(`{"template":"`+t2+`","name":null}`, 0, 0, 0, false, false, false)},
+		{"/v0/account/" + D, ok, acct("null", 2, 2, 0, false, false, false)},
+		{"/v0/account/" + E, ok, acct("null", 1, 0, 0, false, false, false)},
+		{"/v0/account/" + M, ok, acct("null", 0, 0, 2, false, false, false)},
+		{"/v0/account/" + P, ok, acct("null", 0, 0, 0, true, false, false)},
+		{"/v0/account/" + V, ok, acct("null", 0, 0, 0, false, false, true)},
+		{"/v0/account/" + X, ok, acct("null", 0, 0, 0, false, true, false)},
+		{"/v0/account/" + U, ok, acct("null", 0, 0, 0, false, false, false)},
+		{"/v0/account/nope", 400, ""},
+		{"/v0/lsig/" + A, ok, `{"template":"` + t1 + `","name":null,"programs":2,"uses":[` +
+			`{"lsig":"` + A + `","template":"` + t1 + `","signer":null,"sender":null,"txns":1,"firstRound":2,"lastRound":2}]}`},
+		{"/v0/exists/" + X, ok, `{"exists":true}`}, // evicted only
+		{"/v0/exists/" + U, ok, `{"exists":false}`},
+	} {
+		code, body := get(c.url)
+		if code != c.code || (c.code == ok && body != c.want) {
+			t.Errorf("%s = %d %s, want %d %s", c.url, code, body, c.code, c.want)
+		}
+	}
+
+	// Each count is the length of its list.
+	for _, a := range []string{A, C, D, E, M, U} {
+		var acc struct{ Delegations, Multisigs, Signers int }
+		_, body := get("/v0/account/" + a)
+		if err := json.Unmarshal([]byte(body), &acc); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range []struct {
+			list string
+			n    int
+		}{{"delegations", acc.Delegations}, {"subsigner", acc.Multisigs}, {"msig", acc.Signers}} {
+			var l []json.RawMessage
+			_, body := get("/v0/" + c.list + "/" + a)
+			if err := json.Unmarshal([]byte(body), &l); err != nil || len(l) != c.n {
+				t.Errorf("/v0/%s/%s has %d (%v), account count %d", c.list, a, len(l), err, c.n)
+			}
+		}
+	}
+
+	// Keys of untracked features are left out, and with none tracked there is no route.
+	for _, c := range []struct {
+		track config
+		want  string
+	}{
+		{config{Lsigs: true}, `{"lsig":null,"delegations":2}`},
+		{config{Msigs: true}, `{"multisigs":2,"signers":0}`},
+		{config{Proposers: true}, `{"proposed":false,"evicted":false}`},
+		{config{VoterRounds: 100}, `{"voted":false}`},
+	} {
+		track = c.track
+		h = routes(db)
+		if code, body := get("/v0/account/" + D); code != ok || body != c.want {
+			t.Errorf("account with %+v = %d %s, want %s", c.track, code, body, c.want)
+		}
+	}
+	track = config{}
+	h = routes(db)
+	if code, _ := get("/v0/account/" + D); code != 404 {
+		t.Errorf("account with nothing tracked = %d, want 404", code)
 	}
 }

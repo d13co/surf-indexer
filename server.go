@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/algorand/go-algorand-sdk/v2/types"
@@ -349,8 +350,9 @@ func routes(db *sql.DB) http.Handler {
 			FROM (SELECT voter, count(*) AS n FROM voters WHERE`+in+` GROUP BY voter)`)
 		ranged("GET /v0/voter/{addr}", `SELECT coalesce(to_json(list(rnd ORDER BY rnd))::VARCHAR, '[]') FROM voters WHERE voter = $3 AND`+in)
 	}
-	// limited serves q with ?limit as $1 and, for an {addr} or {id} pattern, that value as $2.
-	limited := func(reg func(string, http.HandlerFunc), pattern, q string) {
+	// limitedBy serves query's SQL with ?limit as $1, for an {addr} or {id} pattern that value as $2
+	// (also passed to query), then query's args.
+	limitedBy := func(reg func(string, http.HandlerFunc), pattern string, query func(ctx context.Context, key string) (string, []any, error)) {
 		withAddr, withID := strings.Contains(pattern, "{addr}"), strings.Contains(pattern, "{id}")
 		reg(pattern, func(w http.ResponseWriter, r *http.Request) {
 			n, err := opt(r.URL.Query(), "limit", 1000, parseLimit)
@@ -373,9 +375,20 @@ func routes(db *sql.DB) http.Handler {
 				}
 				args = append(args, id)
 			}
-			replySQL(w, r, db, q, args...)
+			key, _ := args[len(args)-1].(string)
+			q, more, err := query(r.Context(), key)
+			if err != nil {
+				reply(w, r, nil, err)
+				return
+			}
+			replySQL(w, r, db, q, append(args, more...)...)
 		})
 	}
+	limited := func(reg func(string, http.HandlerFunc), pattern, q string) {
+		limitedBy(reg, pattern, func(context.Context, string) (string, []any, error) { return q, nil, nil })
+	}
+	// name is the admin-set name of a template, or null: name + "<tmpl expr>)".
+	const name = `(SELECT name FROM template_names n WHERE n.tmpl = `
 	if track.Lsigs {
 		// uses lists the newest $1 rows matching where; NULL if none. '' stands for NULL in signer/sender.
 		uses := func(where string) string {
@@ -384,13 +397,6 @@ func routes(db *sql.DB) http.Handler {
 				'txns': txns, 'firstRound': first_rnd, 'lastRound': last_rnd}` + newest + `)
 				FROM (SELECT * FROM lsigs WHERE ` + where + newest + ` LIMIT $1))`
 		}
-		// Driven by the lsig's newest row, so one never seen has none: 404.
-		// name is the admin-set template name, or null.
-		const name = `(SELECT name FROM template_names n WHERE n.tmpl = `
-		limited(light, "GET /v0/lsig/{addr}", `SELECT to_json({'template': tmpl, 'name': `+name+`l.tmpl),
-			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = l.tmpl), 'uses': `+uses("prog = $2")+`})::VARCHAR
-			FROM (SELECT tmpl FROM lsigs WHERE prog = $2 ORDER BY last_rnd DESC LIMIT 1) l`)
-		limited(light, "GET /v0/delegations/{addr}", `SELECT coalesce(to_json(`+uses("signer = $2 OR sender = $2")+`)::VARCHAR, '[]')`)
 		// Families of programs, and single programs delegated by several accounts.
 		// Groups every row (~0.7s at 3M rows), and every visitor of algo.surf's /lsigs asks the same, so
 		// the whole list is cached and a smaller limit is its first rows: one entry, whatever the limits.
@@ -399,21 +405,89 @@ func routes(db *sql.DB) http.Handler {
 			'firstRound': f, 'lastRound': l} ORDER BY p DESC, tmpl))::VARCHAR, '[]')
 			FROM (SELECT tmpl, count(DISTINCT prog) AS p, count(DISTINCT signer) FILTER (WHERE signer <> '') AS d, sum(txns) AS n,
 				min(first_rnd) AS f, max(last_rnd) AS l FROM lsigs GROUP BY tmpl HAVING p >= 2 OR d >= 2 ORDER BY p DESC, tmpl LIMIT $1) t`
+		allTemplates := func(ctx context.Context) (string, error) { return querySQL(ctx, db, qTemplates, maxLimit) }
+		// counts are the cached templates list's program counts, parsed once per list. The list has
+		// every template of 2 or more programs, so one missing has 1, unless it was cut at maxLimit
+		// with its last still at 2 or more (most first): then complete is false. Reading programs from
+		// it saves counting a big template's programs per request (~30 ms at 235k), but it lags by up to
+		// the cache's minute.
+		var (
+			cmu             sync.Mutex
+			cSrc            string
+			cIDs            []string
+			cNs             []uint64
+			cByID           map[string]uint64
+			cComplete, cSet bool
+		)
+		counts := func(ctx context.Context) (ids []string, ns []uint64, byID map[string]uint64, complete bool, err error) {
+			s, err := templates.get(ctx, allTemplates)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			cmu.Lock()
+			defer cmu.Unlock()
+			if !cSet || s != cSrc {
+				var list []struct {
+					Template string
+					Programs uint64
+				}
+				if err := json.Unmarshal([]byte(s), &list); err != nil {
+					return nil, nil, nil, false, err
+				}
+				cIDs, cNs, cByID = make([]string, len(list)), make([]uint64, len(list)), make(map[string]uint64, len(list))
+				for i, t := range list {
+					cIDs[i], cNs[i], cByID[t.Template] = t.Template, t.Programs, t.Programs
+				}
+				cSrc, cSet = s, true
+				cComplete = len(list) < maxLimit || list[len(list)-1].Programs < 2
+			}
+			return cIDs, cNs, cByID, cComplete, nil
+		}
+		// countSQL counts tmpl's programs, for when the list can't say: it failed (logged, as the
+		// routes still answer) or is incomplete.
+		countSQL := func(tmpl string, err error) string {
+			if err != nil {
+				slog.Warn("templates list: counting programs instead", "err", err)
+			}
+			return "(SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = " + tmpl + ")"
+		}
+		// Driven by the lsig's newest row, so one never seen has none: 404.
+		// The lsig's template is found in SQL, so its count is looked up there: list $4 at its index in $3.
+		limitedBy(light, "GET /v0/lsig/{addr}", func(ctx context.Context, _ string) (string, []any, error) {
+			p, args := "", []any(nil)
+			ids, ns, _, complete, err := counts(ctx)
+			if err != nil || !complete {
+				p = countSQL("l.tmpl", err)
+			} else {
+				p, args = "coalesce(list_extract($4::UBIGINT[], list_position($3::VARCHAR[], l.tmpl)), 1)", []any{ids, ns}
+			}
+			return `SELECT to_json({'template': tmpl, 'name': ` + name + `l.tmpl), 'programs': ` + p + `, 'uses': ` + uses("prog = $2") + `})::VARCHAR
+				FROM (SELECT tmpl FROM lsigs WHERE prog = $2 ORDER BY last_rnd DESC LIMIT 1) l`, args, nil
+		})
+		limited(light, "GET /v0/delegations/{addr}", `SELECT coalesce(to_json(`+uses("signer = $2 OR sender = $2")+`)::VARCHAR, '[]')`)
 		heavy("GET /v0/templates", func(w http.ResponseWriter, r *http.Request) {
 			n, err := opt(r.URL.Query(), "limit", 1000, parseLimit)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			s, err := templates.get(r.Context(), func(ctx context.Context) (string, error) { return querySQL(ctx, db, qTemplates, maxLimit) })
+			s, err := templates.get(r.Context(), allTemplates)
 			if err == nil {
 				s, err = firstN(s, n)
 			}
 			replyJSON(w, r, s, err)
 		})
-		limited(light, "GET /v0/template/{id}", `SELECT to_json({'template': tmpl, 'name': `+name+`$2), 'logic': logic,
-			'programs': (SELECT count(DISTINCT prog) FROM lsigs WHERE tmpl = $2), 'uses': `+uses("tmpl = $2")+`})::VARCHAR
-			FROM lsig_templates WHERE tmpl = $2`)
+		limitedBy(light, "GET /v0/template/{id}", func(ctx context.Context, id string) (string, []any, error) {
+			p, args := "", []any(nil)
+			_, _, byID, complete, err := counts(ctx)
+			if err != nil || !complete {
+				p = countSQL("$2", err)
+			} else {
+				p, args = "$3::UBIGINT", []any{max(1, byID[id])}
+			}
+			return `SELECT to_json({'template': tmpl, 'name': ` + name + `$2), 'logic': logic, 'programs': ` + p + `,
+				'uses': ` + uses("tmpl = $2") + `})::VARCHAR FROM lsig_templates WHERE tmpl = $2`, args, nil
+		})
 		if adminToken != "" {
 			adminRoutes(mux, db, templates.clear) // a rename shows at once
 		}
@@ -433,7 +507,37 @@ func routes(db *sql.DB) http.Handler {
 		light("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
 			if a, ok := addr(w, r); ok {
 				replySQL(w, r, db, `SELECT to_json({'exists': EXISTS (SELECT 1 FROM blocks WHERE prop = $1)
-					OR EXISTS (SELECT 1 FROM voters WHERE voter = $1)})::VARCHAR`, a)
+					OR EXISTS (SELECT 1 FROM voters WHERE voter = $1) OR EXISTS (SELECT 1 FROM evictions WHERE acct = $1)})::VARCHAR`, a)
+			}
+		})
+	}
+	// What algo.surf's account page needs to pick its tabs before fetching any list: a scan of each
+	// tracked table (~40–50 ms on mainnet), against one request per list. Keys of untracked features are
+	// left out; an address never seen gets zeros.
+	if track.Lsigs || track.Msigs || track.Proposers || track.VoterRounds > 0 {
+		var keys []string
+		from := ""
+		if track.Lsigs {
+			keys = append(keys, `'lsig': (SELECT {'template': tmpl, 'name': `+name+`l.tmpl)}
+				FROM (SELECT tmpl FROM lsigs WHERE prog = $1 ORDER BY last_rnd DESC LIMIT 1) l)`,
+				`'delegations': (SELECT count(*) FROM lsigs WHERE signer = $1 OR sender = $1)`)
+		}
+		if track.Msigs { // both counts in one scan
+			keys = append(keys, `'multisigs': m.multisigs`, `'signers': m.signers`)
+			from = ` FROM (SELECT count(*) FILTER (WHERE signer = $1) AS multisigs, count(*) FILTER (WHERE msig = $1) AS signers
+				FROM msig_signers WHERE signer = $1 OR msig = $1) m`
+		}
+		if track.Proposers {
+			keys = append(keys, `'proposed': EXISTS (SELECT 1 FROM blocks WHERE prop = $1)`,
+				`'evicted': EXISTS (SELECT 1 FROM evictions WHERE acct = $1)`)
+		}
+		if track.VoterRounds > 0 {
+			keys = append(keys, `'voted': EXISTS (SELECT 1 FROM voters WHERE voter = $1)`)
+		}
+		q := `SELECT to_json({` + strings.Join(keys, ", ") + `})::VARCHAR` + from
+		light("GET /v0/account/{addr}", func(w http.ResponseWriter, r *http.Request) {
+			if a, ok := addr(w, r); ok {
+				replySQL(w, r, db, q, a)
 			}
 		})
 	}
