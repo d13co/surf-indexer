@@ -30,15 +30,26 @@ echo "deb [signed-by=/etc/apt/keyrings/d13co.asc] https://apt.d13.co stable main
 sudo apt update && sudo apt install surf-indexer
 ```
 
-The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`):
+The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`). Start from the commented example the package ships:
 
 ```
-sudoedit /etc/surf-indexer/mainnet-v1.0.env   # ALGOD_HOST=..., ALGOD_TOKEN=..., PORT=..., ADMIN_TOKEN=..., REAL_IP_HEADER=... behind a proxy
-sudo chmod 600 /etc/surf-indexer/mainnet-v1.0.env   # it holds tokens; systemd reads it as root
+sudo install -m 600 /usr/share/surf-indexer/example.env /etc/surf-indexer/mainnet-v1.0.env   # it holds tokens; systemd reads it as root
+sudoedit /etc/surf-indexer/mainnet-v1.0.env
+sudo surf-indexer check -env-file /etc/surf-indexer/mainnet-v1.0.env mainnet-v1.0
 sudo systemctl enable --now surf-indexer@mainnet-v1.0
 ```
 
+`check` reads the file as the unit does, fails on unknown names (a typo is otherwise silently ignored) and bad values, then checks each algod answers for that genesis ID (`-offline` skips the algods). Run it after editing the file, before `systemctl restart`.
+
 Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. To switch to another DB of the same network, e.g. one rebuilt with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`, set `DB_ID=<dbID>` in the env file and restart; remove it to switch back. `apt upgrade` restarts running instances.
+
+### Running in production
+
+- The unit is `Type=notify`: `systemctl start` returns once the DB is open and the server listens, so a failed start or upgrade restart shows in `systemctl status`. Logs are JSON lines in the journal: `journalctl -u surf-indexer@mainnet-v1.0`.
+- Config errors exit with code 78, and the unit does not restart on it: a bad env file, a genesis ID algod doesn't report, or a DB of another network or synced with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`. Fix the cause, then `systemctl restart`. Other failures (algod down, disk) restart every 5 s.
+- Shutdown waits for the current ingest batch and DuckDB's checkpoint, up to 5 minutes.
+- Set `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` on a host shared with algod. For a hard cap on the whole process as well, add a drop-in: `sudo systemctl edit surf-indexer@mainnet-v1.0`, then `[Service]` and `MemoryMax=3G`, kept above `DUCKDB_MEMORY_LIMIT`.
+- `apt remove` stops running instances; the DBs in `/var/lib/surf-indexer` and the env files stay.
 
 ### Releasing
 
@@ -323,6 +334,7 @@ Keys of features that are off are left out, and an address never seen gets zeros
 | name        | description                                                    | default_value    |
 | ----------- | -------------------------------------------------------------- | ---------------- |
 | PORT        | HTTP server port                                               | 8118             |
+| LISTEN_ADDR | Address to bind, e.g. `127.0.0.1` behind a proxy; empty for every interface |  |
 | ALGOD_HOST  | Algod host; `;`-separate several for failover                  | http://localhost |
 | ALGOD_PORT  | Algod port; one value, or one per host                         | 8080             |
 | ALGOD_TOKEN | Algod token; one value, or one per host                        |                  |
@@ -337,6 +349,9 @@ Keys of features that are off are left out, and an address never seen gets zeros
 | RATE_LIMIT  | Per-client requests/s across all routes, burst 5×; 0 for no per-client limits ([rate limits](#rate-limits)) | 10 |
 | HEAVY_CONCURRENCY | Heavy requests running at once, across all clients; 0 for no cap | 4 |
 | REAL_IP_HEADER | Header holding the visitor IP behind a proxy, read only from a loopback or private peer, e.g. `CF-Connecting-IP` |  |
+| DUCKDB_MEMORY_LIMIT | DuckDB memory cap, e.g. `2GB`; DuckDB's default is 80% of RAM |  |
+| DUCKDB_THREADS | DuckDB worker threads; 0 for DuckDB's default (every core) | 0 |
+| DB_ID       | systemd unit only: serve `data/<DB_ID>.duckdb` (the dbID argument) | the genesis ID |
 | START_ROUND | Trials only: an empty DB starts at this round ([bulk load](#bulk-load-from-an-archival-nodes-ledger)) | 0 |
 
 `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.

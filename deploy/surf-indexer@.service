@@ -1,14 +1,19 @@
 # One instance per network, named by its genesis ID:
-#   systemctl enable --now surf-indexer@mainnet-v1.0
+#   sudo install -m 600 /usr/share/surf-indexer/example.env /etc/surf-indexer/mainnet-v1.0.env
+#   sudo surf-indexer check -env-file /etc/surf-indexer/mainnet-v1.0.env mainnet-v1.0
+#   sudo systemctl enable --now surf-indexer@mainnet-v1.0
 # reads /etc/surf-indexer/mainnet-v1.0.env (ALGOD_*, PORT, ...) and keeps its
 # DB in /var/lib/surf-indexer/data/mainnet-v1.0.duckdb, or <DB_ID>.duckdb if
-# the env file sets DB_ID.
+# the env file sets DB_ID. For a memory cap on the process, add MemoryMax= in a
+# drop-in (systemctl edit), above the env file's DUCKDB_MEMORY_LIMIT.
 [Unit]
 Description=surf-indexer %i
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Ready once the DB is open and the server listens.
+Type=notify
 User=surf-indexer
 Group=surf-indexer
 EnvironmentFile=/etc/surf-indexer/%i.env
@@ -17,10 +22,30 @@ StateDirectory=surf-indexer
 WorkingDirectory=/var/lib/surf-indexer
 Restart=always
 RestartSec=5
+# 78: a config error (bad env file, wrong network or DB) that a restart won't fix.
+RestartPreventExitStatus=78
+# Start waits on algod; stop on the ingest batch and DuckDB's checkpoint.
+TimeoutStartSec=5min
+TimeoutStopSec=5min
+
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

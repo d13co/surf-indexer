@@ -22,8 +22,12 @@ contents:
   - src: deploy/surf-indexer@.service
     dst: /lib/systemd/system/surf-indexer@.service
     file_info: {mode: 0644}
+  - src: deploy/example.env
+    dst: /usr/share/surf-indexer/example.env
+    file_info: {mode: 0644}
   - dst: /etc/surf-indexer # per-instance env files, which hold algod tokens
     type: dir
     file_info: {mode: 0700}
 scripts:
   postinstall: deploy/postinst.sh
+  preremove: deploy/prerm.sh
