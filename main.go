@@ -6,13 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,30 +33,6 @@ func envStr(name, def string) string {
 func fatal(msg string, args ...any) {
 	slog.Error(msg, args...)
 	os.Exit(1)
-}
-
-func envInt(name string, def, min int) int {
-	v := os.Getenv(name)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < min {
-		fatal(fmt.Sprintf("%s: expected an integer >= %d", name, min), "got", v)
-	}
-	return n
-}
-
-func envBool(name string, def bool) bool {
-	v := os.Getenv(name)
-	if v == "" {
-		return def
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		fatal(name+": expected a boolean", "got", v)
-	}
-	return b
 }
 
 // algodClients builds one client per ';'-separated ALGOD_HOST/PORT/TOKEN entry.
@@ -108,12 +82,17 @@ func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 	}
 	// DuckDB's file lock also stops a second instance from opening the same DB.
 	db, err := openDB("data/"+dbID+".duckdb", genesisID)
-	if err != nil {
+	if errors.As(err, new(configErr)) {
+		fatalConfig("open db", "err", err)
+	} else if err != nil {
 		fatal("open db", "err", err)
 	}
-	if n, lo, hi, err := rounds(ctx, db); err != nil || n > 0 && (lo != int64(startRound) || hi+1-lo != n) {
+	if n, lo, hi, err := rounds(ctx, db); err != nil {
 		db.Close()
-		fatal("db not contiguous from START_ROUND", "startRound", startRound, "records", n, "minRound", lo, "maxRound", hi, "err", err)
+		fatal("db rounds", "err", err)
+	} else if n > 0 && (lo != int64(startRound) || hi+1-lo != n) {
+		db.Close()
+		fatalConfig("db not contiguous from START_ROUND", "startRound", startRound, "records", n, "minRound", lo, "maxRound", hi)
 	} else {
 		storedTip.Store(uint64(max(hi, 0)))
 	}
@@ -144,11 +123,14 @@ func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil))) // also routes any log package output
 	if len(os.Args) < 2 {
-		fatal("usage: surf-indexer <genesisID> [dbID] | version")
+		fatal("usage: surf-indexer <genesisID> [dbID] | check [-env-file FILE] [-offline] <genesisID> | version")
 	}
-	if os.Args[1] == "version" {
+	switch os.Args[1] {
+	case "version":
 		fmt.Println("surf-indexer", version)
 		return
+	case "check":
+		os.Exit(check(os.Args[2:]))
 	}
 	genesisID, dbID := os.Args[1], os.Args[1]
 	if len(os.Args) > 2 {
@@ -156,46 +138,38 @@ func main() {
 	}
 
 	// Before either path: importLedger opens the DB and ingests with it too.
-	voterRounds := envInt("VOTER_ROUNDS", 100000, 0)
-	if voterRounds > math.MaxUint32 {
-		fatal("VOTER_ROUNDS: expected < 2^32", "got", voterRounds)
+	s, err := loadConfig()
+	if err != nil {
+		fatalConfig("config", "err", err)
 	}
-	track = config{Proposers: envBool("PROPOSERS", true), VoterRounds: uint64(voterRounds), Lsigs: envBool("LSIGS", false), Msigs: envBool("MSIGS", false)}
-	adminToken = os.Getenv("ADMIN_TOKEN")
-	if err := checkAdminToken(adminToken, track.Lsigs); err != nil {
-		fatal("ADMIN_TOKEN: " + err.Error())
-	}
-	limits = limitConfig{Rate: envInt("RATE_LIMIT", 10, 0), Heavy: envInt("HEAVY_CONCURRENCY", 4, 0), RealIPHeader: os.Getenv("REAL_IP_HEADER")}
-	if startRound = uint64(envInt("START_ROUND", 0, 0)); startRound > math.MaxUint32 {
-		fatal("START_ROUND: expected < 2^32", "got", startRound)
-	}
+	track, adminToken, limits, startRound, dbOptions = s.track, s.adminToken, s.limits, s.startRound, s.dbOptions
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	concurrency, chunk, ledger, port := envInt("CONCURRENCY", 10, 1), envInt("DB_CHUNKS", 1000, 1), os.Getenv("LEDGER_DB"), envStr("PORT", "8118")
-	slog.Info("config", "version", version, "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", ledger, "port", port,
+	concurrency, chunk := s.concurrency, s.chunk
+	slog.Info("config", "version", version, "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", s.ledger, "listen", s.listen,
 		"proposers", track.Proposers, "voterRounds", track.VoterRounds, "lsigs", track.Lsigs, "msigs", track.Msigs, "startRound", startRound, "admin", adminToken != "",
-		"rateLimit", limits.Rate, "heavyConcurrency", limits.Heavy, "realIPHeader", limits.RealIPHeader)
-	if ledger != "" {
-		importLedger(ctx, ledger, genesisID, dbID, concurrency, chunk)
+		"rateLimit", limits.Rate, "heavyConcurrency", limits.Heavy, "realIPHeader", limits.RealIPHeader, "duckdb", dbOptions.Encode())
+	if s.ledger != "" {
+		importLedger(ctx, s.ledger, genesisID, dbID, concurrency, chunk)
 		return
 	}
 
 	a, err := algodClients(concurrency)
 	if err != nil {
-		fatal("algod config", "err", err)
+		fatalConfig("algod config", "err", err)
 	}
 	params, err := call(ctx, a, func(c *algod.Client) (types.SuggestedParams, error) { return c.SuggestedParams().Do(ctx) })
 	if err != nil {
 		fatal("algod", "err", err)
 	}
 	if params.GenesisID != genesisID {
-		fatal("genesis ID mismatch", "want", genesisID, "got", params.GenesisID)
+		fatalConfig("genesis ID mismatch", "want", genesisID, "got", params.GenesisID)
 	}
 
 	// Listen before opening the DB so a busy port fails fast with a non-zero exit.
-	ln, err := net.Listen("tcp", ":"+port)
+	ln, err := net.Listen("tcp", s.listen)
 	if err != nil {
 		fatal("listen", "err", err)
 	}
@@ -221,8 +195,11 @@ func main() {
 		}
 	}()
 
+	sdNotify("READY=1")
+
 	<-ctx.Done()
 	slog.Info("shutting down")
+	sdNotify("STOPPING=1")
 	srv.Shutdown(context.Background())
 	<-done
 	if err := db.Close(); err != nil {

@@ -34,8 +34,34 @@ jobs:
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: go test -race -count=1 ./...
-      - run: sh -n deploy/postinst.sh .github/apt-publish.sh
-      # Catch packaging mistakes before a tag does.
-      - run: go build -o bin/surf-indexer .
+      - run: sh -n deploy/postinst.sh deploy/prerm.sh .github/apt-publish.sh
+
+  # The .deb as the release builds it (on 22.04, for its glibc), installed on a real systemd host.
+  package:
+    if: github.repository == 'd13co/surf-indexer'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
       - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
-      - run: DEB_VERSION=0.0.0 ARCH=amd64 nfpm pkg -p deb -t "$RUNNER_TEMP"
+      # Catch a broken cross toolchain before a tag does.
+      - run: GOARCH=arm64 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ CGO_ENABLED=1 go build -o "$RUNNER_TEMP/surf-indexer-arm64" .
+      - run: go build -o bin/surf-indexer . && DEB_VERSION=0.0.0 ARCH=amd64 nfpm pkg -p deb -t dist/
+      - name: Install, check, remove
+        run: |
+          sudo apt-get install -y ./dist/surf-indexer_0.0.0_amd64.deb
+          surf-indexer version
+          getent passwd surf-indexer
+          systemd-analyze verify surf-indexer@mainnet-v1.0.service
+          surf-indexer check -offline -env-file /usr/share/surf-indexer/example.env mainnet-v1.0
+          sudo apt-get remove -y surf-indexer
+          test ! -e /usr/bin/surf-indexer
+      # The oldest supported target: the .deb's depends resolve and the binary runs.
+      - run: docker run --rm -v "$PWD/dist:/dist:ro" debian:12 sh -c 'apt-get update -qq && apt-get install -y -qq /dist/surf-indexer_0.0.0_amd64.deb && surf-indexer version'

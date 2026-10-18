@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"sync/atomic"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -96,10 +97,16 @@ const msigTable = `CREATE TABLE IF NOT EXISTS msig_signers(
 
 var track config // from env at startup; openDB refuses a DB synced with another
 
+var dbOptions url.Values // DuckDB config options for openDB, from env at startup (DUCKDB_*)
+
 // openDB opens or creates the DB, refusing one that holds another network's blocks or was
 // synced with another config than track. A fees-only DB from before config gains prop/pp.
 func openDB(path, genesisID string) (*sql.DB, error) {
-	db, err := sql.Open("duckdb", path)
+	dsn := path
+	if len(dbOptions) > 0 {
+		dsn += "?" + dbOptions.Encode()
+	}
+	db, err := sql.Open("duckdb", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +135,7 @@ func setup(db *sql.DB, path, genesisID string) error {
 		err = tx.QueryRow("SELECT genesis FROM meta").Scan(&stored)
 	}
 	if err == nil && stored != genesisID {
-		return fmt.Errorf("%s holds %s blocks, not %s", path, stored, genesisID)
+		return configErr{fmt.Errorf("%s holds %s blocks, not %s", path, stored, genesisID)}
 	}
 	if err == nil {
 		err = tx.QueryRow(`SELECT count(*) = 0 FROM duckdb_columns() WHERE table_name = 'blocks' AND column_name = 'prop'`).Scan(&legacy)
@@ -152,8 +159,8 @@ func setup(db *sql.DB, path, genesisID string) error {
 		return err
 	}
 	if hasBlocks && have != track {
-		return fmt.Errorf("%s was synced with PROPOSERS=%t VOTER_ROUNDS=%d LSIGS=%t MSIGS=%t: run with those, or rebuild into a new file (LEDGER_DB) to change them",
-			path, have.Proposers, have.VoterRounds, have.Lsigs, have.Msigs)
+		return configErr{fmt.Errorf("%s was synced with PROPOSERS=%t VOTER_ROUNDS=%d LSIGS=%t MSIGS=%t: run with those, or rebuild into a new file (LEDGER_DB) to change them",
+			path, have.Proposers, have.VoterRounds, have.Lsigs, have.Msigs)}
 	}
 	if legacy {
 		if _, err = tx.Exec("ALTER TABLE blocks ADD COLUMN prop VARCHAR"); err == nil {
