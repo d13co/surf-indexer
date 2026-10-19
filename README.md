@@ -1,110 +1,40 @@
 # surf-indexer
 
-Stores the timestamp, txn counter and fees of every block of one network in DuckDB, ingested from an archival algod, and serves fee sums and block lookups. Optionally it also stores each block's proposer, payout and evicted (absent) accounts, and the cert voters of recent rounds, serving the [block-proposers](#proposers-and-voters) routes. It can also index every logic sig used, with its delegators and template ([logic sigs](#logic-sigs)).
+An HTTP API over the full block history of one Algorand network. Find the block at a given time or txn counter, sum fees over any range, chart fees and TPS, and follow consensus upgrades. Optional modules add block proposers, payouts and evictions, cert voters, logic sig and delegation lookups, and multisig subsigners.
+
+It keeps everything in a single DuckDB file, filled from an archival algod (or straight from its ledger DB for a fast first load), and follows the chain tip block by block.
 
 API should be considered **unstable**.
 
-## Getting Started
+## Features
 
-Requires Go 1.26+ and CGO (DuckDB).
+| Feature | What it answers | Enabled by | Routes |
+| ------- | --------------- | ---------- | ------ |
+| [Block lookup](#block-lookup) | Which block was at a given time? Which one holds a given txn, or created a given app or asset? | always | `/v0/block` |
+| [Fee sums](#fee-sums) | How much was paid in fees over a round or time range, or the last 24h / 7d / 30d? | always | `/v0/fees`, `/v0/fees/<period>` |
+| [Series](#series) | Fees, txns and TPS per block, minute, hour, day, week or month, for charts | always | `/v0/series` |
+| [Upgrades](#upgrades) | Every consensus upgrade proposal, its vote and when it switched on | always | `/v0/upgrades` |
+| [Proposers](#proposers-and-voters) | Who proposed which blocks, their payouts, the highest payouts, who was evicted (suspended) and when | `PROPOSERS` (on) | `/v0/proposers`, `/v0/proposer/<address>`, `/v0/payouts/highest`, `/v0/evictions`, `/v0/round/<rnd>` |
+| [Voters](#proposers-and-voters) | Who voted in block certs over a recent window, and in which rounds | `VOTER_ROUNDS` (100000) | `/v0/voters`, `/v0/voter/<address>`; `/v0/exists/<address>` with either |
+| [Logic sigs](#logic-sigs) | Which logic sigs an account delegated or was moved by, how much each was used, and which share a template | `LSIGS` (off) | `/v0/lsig/<address>`, `/v0/delegations/<address>`, `/v0/templates`, `/v0/template/<id>` |
+| [Multisig subsigners](#multisig-subsigners) | Which multisigs a key belongs to, the subsigners of a multisig, and whether each key ever signed | `MSIGS` (off) | `/v0/subsigner/<address>`, `/v0/msig/<address>` |
+| [Account summary](#account-summary) | What every enabled feature knows of an address, in one request | any of the four above | `/v0/account/<address>` |
+| [Admin](#admin) | Name logic sig templates (e.g. "Tinyman v1 pool") | `ADMIN_TOKEN` | `PUT`/`DELETE /v0/admin/template/<id>` |
 
-```
-go build -o surf-indexer .
-ALGOD_HOST=http://localhost ALGOD_PORT=8080 ALGOD_TOKEN=... ./surf-indexer mainnet-v1.0
-```
-
-The first argument is the expected genesis ID (startup fails if algod reports another). An optional second argument names the DB: `data/<dbID>.duckdb`, default `data/<genesisID>.duckdb`.
-
-Ingestion starts at round 0 (or `START_ROUND`) and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks, and for every round with `LSIGS` or `MSIGS` on, which need each block's txns.
-
-Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
-
-### Install from apt
-
-On Debian 12+ and Ubuntu 22.04+ (amd64, arm64), from the apt repository at `https://apt.d13.co`:
+[`/v0/status`](#status) reports the tip and which features this instance runs with. Every response allows any origin (`Access-Control-Allow-Origin: *`), so browsers can call it directly, and clients are [rate limited](#rate-limits) per IP.
 
 ```
-sudo install -d -m 0755 /etc/apt/keyrings
-sudo curl -fsSL https://apt.d13.co/key.asc -o /etc/apt/keyrings/d13co.asc
-echo "deb [signed-by=/etc/apt/keyrings/d13co.asc] https://apt.d13.co stable main" | sudo tee /etc/apt/sources.list.d/d13co.list
-sudo apt update && sudo apt install surf-indexer
+curl 'localhost:8118/v0/block?ts=2025-01-23T14:00:00Z'
+curl 'localhost:8118/v0/fees/24h'
+curl 'localhost:8118/v0/series?interval=day&start=2025-10-01'
+curl 'localhost:8118/v0/proposer/<address>/stats?start=2025-01-01'
 ```
 
-The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`). Start from the commented example the package ships:
-
-```
-sudo install -m 600 /usr/share/surf-indexer/example.env /etc/surf-indexer/mainnet-v1.0.env   # it holds tokens; systemd reads it as root
-sudoedit /etc/surf-indexer/mainnet-v1.0.env
-sudo surf-indexer check -env-file /etc/surf-indexer/mainnet-v1.0.env mainnet-v1.0
-sudo systemctl enable --now surf-indexer@mainnet-v1.0
-```
-
-`check` reads the file as the unit does, fails on unknown names (a typo is otherwise silently ignored) and bad values, then checks each algod answers for that genesis ID (`-offline` skips the algods). Run it after editing the file, before `systemctl restart`.
-
-Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. To switch to another DB of the same network, e.g. one rebuilt with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`, set `DB_ID=<dbID>` in the env file and restart; remove it to switch back. `apt upgrade` restarts running instances.
-
-### Running in production
-
-- The unit is `Type=notify`: `systemctl start` returns once the DB is open and the server listens, so a failed start or upgrade restart shows in `systemctl status`. Logs are JSON lines in the journal: `journalctl -u surf-indexer@mainnet-v1.0`.
-- Config errors exit with code 78, and the unit does not restart on it: a bad env file, a genesis ID algod doesn't report, or a DB of another network or synced with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`. Fix the cause, then `systemctl restart`. Other failures (algod down, disk) restart every 5 s.
-- Shutdown waits for the current ingest batch and DuckDB's checkpoint, up to 5 minutes.
-- Set `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` on a host shared with algod. For a hard cap on the whole process as well, add a drop-in: `sudo systemctl edit surf-indexer@mainnet-v1.0`, then `[Service]` and `MemoryMax=3G`, kept above `DUCKDB_MEMORY_LIMIT`.
-- `apt remove` stops running instances; the DBs in `/var/lib/surf-indexer` and the env files stay.
-
-### Releasing
-
-Push a `v1.2.3` tag. The release workflow tests, builds the linux amd64 and arm64 binaries and `.deb`s into a GitHub release, then, once approved in the `apt` environment, adds the `.deb`s to the apt repository and signs its index ([.github/apt-publish.sh](.github/apt-publish.sh)).
-
-### Bulk load from an archival node's ledger
-
-Catching up from round 0 over REST is slow. On the archival node's machine, read its block DB directly instead, then copy the DuckDB file to the server:
-
-```
-# on the archival node, as the algod user: any -shm/-wal files SQLite creates must stay algod's
-find <algod datadir> -name ledger.block.sqlite
-LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0
-```
-
-What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0`.
-
-This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
-
-```
-rsync -P data/mainnet-v1.0.duckdb server:surf-indexer/data/mainnet-v1.0.duckdb.new
-# on the server
-rm -f data/mainnet-v1.0.duckdb.wal   # a stale WAL would be replayed onto the new file
-mv data/mainnet-v1.0.duckdb.new data/mainnet-v1.0.duckdb
-```
-
-Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS`.
-
-With proposers on, rounds before the incentives upgrade read their whole cert from the ledger (~60 KB per round, ~2.8 TB over mainnet's first 46.5M rounds), so the import is I/O-bound.
-
-To try a config on recent rounds before a full import, set `START_ROUND` to start an empty DB there, e.g. for the last 3.5M rounds:
-
-```
-L=<path to ledger.block.sqlite>
-S=$(sqlite3 -readonly "$L" 'SELECT max(rnd) - 3500000 FROM blocks'); echo $S   # note it: resuming and serving need the same value
-START_ROUND=$S LSIGS=1 LEDGER_DB=$L CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0 lsig-trial
-```
-
-Such a DB is partial: fee sums, series, logic sig `txns` and `firstRound`s, and multisig pointers and `signed` cover only its rounds, and it opens only with the same `START_ROUND` (and a DB from round 0 only without it).
-
-It is safe to run beside a live algod: the DB is opened read-only, and WAL readers don't block algod's writes. It does compete with algod for disk, page cache and CPU, so watch algod's lag (`goal node status`) and throttle with `CONCURRENCY`, or stop algod for the duration.
+To run your own, see [Running it](#running-it).
 
 ## Routes
 
 All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC midnight) and RFC3339 are also accepted.
-
-### Rate limits
-
-Each client (IP address, an IPv6 one as its /64) gets `RATE_LIMIT` requests per second across all routes, in bursts of up to 5× that (default 10/s, burst 50). Heavy requests also take one of 30 per minute, in bursts of up to 10. Heavy are `/v0/series`, `/v0/fees` (not `/v0/fees/<period>`), `/v0/templates`, and any [proposer or voter](#proposers-and-voters) route taking a round range (`/v0/proposers`, `/v0/proposer/<address>` and its `/stats`, `/v0/payouts/highest`, `/v0/evictions` and `/v0/evictions/<address>`, `/v0/voters`, `/v0/voter/<address>`) when that range, up to the tip, covers 5M rounds (~6 months) or more: by default it is all of history. Over either limit, a request gets **429** with `Retry-After` (seconds). `RATE_LIMIT=0` turns these off.
-
-At most `HEAVY_CONCURRENCY` heavy requests query at once across all clients (default 4); each frees its turn once its query is done, before its reply is sent. One that waits 10 s for a turn gets **503** with `Retry-After`. Every request has 30 s: a query still running then is interrupted and gets **503**. A response must be sent within 2 minutes of the request.
-
-Every response, 429s and 503s included, carries `Access-Control-Allow-Origin: *` and exposes `Retry-After` and `X-Truncated` to browsers.
-
-Behind a proxy every client shares the proxy's address, so set `REAL_IP_HEADER` to the header holding the visitor's IP, e.g. `CF-Connecting-IP` behind a Cloudflare Tunnel. It is read only from a loopback or private peer (cloudflared on the host, in docker or on the LAN), so a client reaching the port directly can't choose its own. A request from such a peer without a valid value is limited by the peer address, with a warning logged once. With Cloudflare, keep the zone's *Remove visitor IP headers* Managed Transform and *Pseudo IPv4* off: the first strips the header, the second puts a made-up IPv4 in it for IPv6 visitors.
 
 ### Status
 
@@ -279,20 +209,6 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 
 `name`, also in `/v0/templates` and `/v0/lsig/<address>`, is the template's name as set by an [admin](#admin), or `null`.
 
-### Admin
-
-These routes exist only with `ADMIN_TOKEN` set, which needs `LSIGS` on (startup fails otherwise); without it they 404. Each needs the header `Authorization: Bearer <ADMIN_TOKEN>`, else 401. They are meant for curl, not browsers: there is no CORS preflight.
-
-`PUT /v0/admin/template/<id>` with body `{"name":"Tinyman v1 pool"}`: names a template, replacing any name. The name is trimmed, and must be 1 to 100 visible characters or spaces: no control, zero-width or text-direction characters (400 otherwise; 413 for a body over 4 KiB). Returns `{"name":"…","template":"…"}`, or 404 if no lsig of that template was seen.
-
-```
-curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"name":"Tinyman v1 pool"}' localhost:8118/v0/admin/template/3f2c9a1b7d0e4c55
-```
-
-`DELETE /v0/admin/template/<id>`: removes its name. 204 whether or not it had one.
-
-Names are stored in the DB (`template_names`), so a rebuilt DB starts without them. Copy them over with the `duckdb` CLI, server stopped: `duckdb new.duckdb "ATTACH 'old.duckdb' AS o (READ_ONLY); INSERT INTO template_names SELECT * FROM o.template_names"`.
-
 ### Multisig subsigners
 
 These routes exist only with `MSIGS` on; otherwise they 404.
@@ -329,7 +245,117 @@ A multisig preimage this build can't read (a new msig version, or a key that isn
 
 Keys of features that are off are left out, and an address never seen gets zeros and `false`. With all four off the route 404s. Not ranged and never heavy.
 
-## Environment Variables
+### Admin
+
+These routes exist only with `ADMIN_TOKEN` set, which needs `LSIGS` on (startup fails otherwise); without it they 404. Each needs the header `Authorization: Bearer <ADMIN_TOKEN>`, else 401. They are meant for curl, not browsers: there is no CORS preflight.
+
+`PUT /v0/admin/template/<id>` with body `{"name":"Tinyman v1 pool"}`: names a template, replacing any name. The name is trimmed, and must be 1 to 100 visible characters or spaces: no control, zero-width or text-direction characters (400 otherwise; 413 for a body over 4 KiB). Returns `{"name":"…","template":"…"}`, or 404 if no lsig of that template was seen.
+
+```
+curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"name":"Tinyman v1 pool"}' localhost:8118/v0/admin/template/3f2c9a1b7d0e4c55
+```
+
+`DELETE /v0/admin/template/<id>`: removes its name. 204 whether or not it had one.
+
+Names are stored in the DB (`template_names`), so a rebuilt DB starts without them. Copy them over with the `duckdb` CLI, server stopped: `duckdb new.duckdb "ATTACH 'old.duckdb' AS o (READ_ONLY); INSERT INTO template_names SELECT * FROM o.template_names"`.
+
+### Rate limits
+
+Each client (IP address, an IPv6 one as its /64) gets `RATE_LIMIT` requests per second across all routes, in bursts of up to 5× that (default 10/s, burst 50). Heavy requests also take one of 30 per minute, in bursts of up to 10. Heavy are `/v0/series`, `/v0/fees` (not `/v0/fees/<period>`), `/v0/templates`, and any [proposer or voter](#proposers-and-voters) route taking a round range (`/v0/proposers`, `/v0/proposer/<address>` and its `/stats`, `/v0/payouts/highest`, `/v0/evictions` and `/v0/evictions/<address>`, `/v0/voters`, `/v0/voter/<address>`) when that range, up to the tip, covers 5M rounds (~6 months) or more: by default it is all of history. Over either limit, a request gets **429** with `Retry-After` (seconds). `RATE_LIMIT=0` turns these off.
+
+At most `HEAVY_CONCURRENCY` heavy requests query at once across all clients (default 4); each frees its turn once its query is done, before its reply is sent. One that waits 10 s for a turn gets **503** with `Retry-After`. Every request has 30 s: a query still running then is interrupted and gets **503**. A response must be sent within 2 minutes of the request.
+
+Every response, 429s and 503s included, carries `Access-Control-Allow-Origin: *` and exposes `Retry-After` and `X-Truncated` to browsers.
+
+Behind a proxy every client shares the proxy's address, so set `REAL_IP_HEADER` to the header holding the visitor's IP, e.g. `CF-Connecting-IP` behind a Cloudflare Tunnel. It is read only from a loopback or private peer (cloudflared on the host, in docker or on the LAN), so a client reaching the port directly can't choose its own. A request from such a peer without a valid value is limited by the peer address, with a warning logged once. With Cloudflare, keep the zone's *Remove visitor IP headers* Managed Transform and *Pseudo IPv4* off: the first strips the header, the second puts a made-up IPv4 in it for IPv6 visitors.
+
+## Running it
+
+### Build from source
+
+Requires Go 1.26+ and CGO (DuckDB).
+
+```
+go build -o surf-indexer .
+ALGOD_HOST=http://localhost ALGOD_PORT=8080 ALGOD_TOKEN=... ./surf-indexer mainnet-v1.0
+```
+
+The first argument is the expected genesis ID (startup fails if algod reports another). An optional second argument names the DB: `data/<dbID>.duckdb`, default `data/<genesisID>.duckdb`.
+
+Ingestion starts at round 0 (or `START_ROUND`) and catches up in parallel batches, then follows the chain block by block. Once blocks carry `fc` (the incentives upgrade, mainnet round 46512890), only block headers are fetched, except for rounds in the voter window (`VOTER_ROUNDS`), whose certs need full blocks, and for every round with `LSIGS` or `MSIGS` on, which need each block's txns.
+
+Consensus upgrades are found by sampling every 10000th round's header (an upgrade vote lasts exactly 10000 rounds, so none is missed). An existing DB backfills them on first start, a fresh REST ingest once it reaches the tip. This needs an archival algod and a network on standard consensus params; otherwise `upgrades` errors repeat in the log every 10 minutes while fee ingest carries on.
+
+### Install from apt
+
+On Debian 12+ and Ubuntu 22.04+ (amd64, arm64), from the apt repository at `https://apt.d13.co`:
+
+```
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://apt.d13.co/key.asc -o /etc/apt/keyrings/d13co.asc
+echo "deb [signed-by=/etc/apt/keyrings/d13co.asc] https://apt.d13.co stable main" | sudo tee /etc/apt/sources.list.d/d13co.list
+sudo apt update && sudo apt install surf-indexer
+```
+
+The package starts nothing. Run one `surf-indexer@<genesisID>` instance per network, configured by an env file with the [environment variables](#environment-variables) (give each instance its own `PORT`). Start from the commented example the package ships:
+
+```
+sudo install -m 600 /usr/share/surf-indexer/example.env /etc/surf-indexer/mainnet-v1.0.env   # it holds tokens; systemd reads it as root
+sudoedit /etc/surf-indexer/mainnet-v1.0.env
+sudo surf-indexer check -env-file /etc/surf-indexer/mainnet-v1.0.env mainnet-v1.0
+sudo systemctl enable --now surf-indexer@mainnet-v1.0
+```
+
+`check` reads the file as the unit does, fails on unknown names (a typo is otherwise silently ignored) and bad values, then checks each algod answers for that genesis ID (`-offline` skips the algods). Run it after editing the file, before `systemctl restart`.
+
+Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-indexer` user. To switch to another DB of the same network, e.g. one rebuilt with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`, set `DB_ID=<dbID>` in the env file and restart; remove it to switch back. `apt upgrade` restarts running instances.
+
+### Running in production
+
+- The unit is `Type=notify`: `systemctl start` returns once the DB is open and the server listens, so a failed start or upgrade restart shows in `systemctl status`. Logs are JSON lines in the journal: `journalctl -u surf-indexer@mainnet-v1.0`.
+- Config errors exit with code 78, and the unit does not restart on it: a bad env file, a genesis ID algod doesn't report, or a DB of another network or synced with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`. Fix the cause, then `systemctl restart`. Other failures (algod down, disk) restart every 5 s.
+- Shutdown waits for the current ingest batch and DuckDB's checkpoint, up to 5 minutes.
+- Set `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` on a host shared with algod. For a hard cap on the whole process as well, add a drop-in: `sudo systemctl edit surf-indexer@mainnet-v1.0`, then `[Service]` and `MemoryMax=3G`, kept above `DUCKDB_MEMORY_LIMIT`.
+- `apt remove` stops running instances; the DBs in `/var/lib/surf-indexer` and the env files stay.
+
+### Bulk load from an archival node's ledger
+
+Catching up from round 0 over REST is slow. On the archival node's machine, read its block DB directly instead, then copy the DuckDB file to the server:
+
+```
+# on the archival node, as the algod user: any -shm/-wal files SQLite creates must stay algod's
+find <algod datadir> -name ledger.block.sqlite
+LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0
+```
+
+What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0`.
+
+This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
+
+```
+rsync -P data/mainnet-v1.0.duckdb server:surf-indexer/data/mainnet-v1.0.duckdb.new
+# on the server
+rm -f data/mainnet-v1.0.duckdb.wal   # a stale WAL would be replayed onto the new file
+mv data/mainnet-v1.0.duckdb.new data/mainnet-v1.0.duckdb
+```
+
+Start the server as usual; it resumes from the last imported round over REST, so its algod must be archival. The import and the server must run with the same `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS`.
+
+With proposers on, rounds before the incentives upgrade read their whole cert from the ledger (~60 KB per round, ~2.8 TB over mainnet's first 46.5M rounds), so the import is I/O-bound.
+
+To try a config on recent rounds before a full import, set `START_ROUND` to start an empty DB there, e.g. for the last 3.5M rounds:
+
+```
+L=<path to ledger.block.sqlite>
+S=$(sqlite3 -readonly "$L" 'SELECT max(rnd) - 3500000 FROM blocks'); echo $S   # note it: resuming and serving need the same value
+START_ROUND=$S LSIGS=1 LEDGER_DB=$L CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0 lsig-trial
+```
+
+Such a DB is partial: fee sums, series, logic sig `txns` and `firstRound`s, and multisig pointers and `signed` cover only its rounds, and it opens only with the same `START_ROUND` (and a DB from round 0 only without it).
+
+It is safe to run beside a live algod: the DB is opened read-only, and WAL readers don't block algod's writes. It does compete with algod for disk, page cache and CPU, so watch algod's lag (`goal node status`) and throttle with `CONCURRENCY`, or stop algod for the duration.
+
+### Environment Variables
 
 | name        | description                                                    | default_value    |
 | ----------- | -------------------------------------------------------------- | ---------------- |
@@ -356,6 +382,12 @@ Keys of features that are off are left out, and an address never seen gets zeros
 
 `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.
 
+### Disk and DB size
+
 Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB. Logic sigs take an estimated ~80 B per (program, signer, sender) plus one program per template, growing with distinct programs rather than rounds. Multisig subsigners take an estimated ~80 B per (subsigner, multisig), growing with distinct multisigs rather than rounds. With `LSIGS` or `MSIGS` on every round is a full block fetch (shared when both are on): free at the tip while `VOTER_ROUNDS` is above 0, else ~70 KB per block (~2 GB/day) over REST, and a ledger import reads whole blocks after the incentives upgrade too.
 
 Estimated mainnet DB size: ~0.45 GB with the defaults (proposers on, 100k-round voter window), and ~0.5–0.9 GB with `LSIGS`. Blocks grow by ~11 B per round at today's format, ~100 MiB a year; the voter window stays flat. The logic sig share is a guess (0.5–5M rows at ~80 B): a trial over rounds 58.0M–65.8M stored only 4,645 rows (~1 MiB), but most lsig use is older (Tinyman v1, NFT-listing escrows), so only a full `LSIGS` import gives the real figure. The file is about the size of its data: the trial's 121.5 MiB file is nearly all used blocks.
+
+### Releasing
+
+Push a `v1.2.3` tag. The release workflow tests, builds the linux amd64 and arm64 binaries and `.deb`s into a GitHub release, then, once approved in the `apt` environment, adds the `.deb`s to the apt repository and signs its index ([.github/apt-publish.sh](.github/apt-publish.sh)).
