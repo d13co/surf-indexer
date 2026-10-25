@@ -114,6 +114,12 @@ func openDB(path, genesisID string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	n, _, hi, err := rounds(context.Background(), db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	stored.Store(&storedRounds{n, hi})
 	return db, nil
 }
 
@@ -201,8 +207,19 @@ func rounds(ctx context.Context, db *sql.DB) (n, lo, hi int64, err error) {
 // insertBatch appends rows, their evictions and voters in one transaction, so a batch lands whole
 // or not at all, then drops voters that fell out of the window.
 // List params + unnest is ~20x faster than a prepared INSERT per row.
-// storedTip is the last stored round, for sizing requests; set by openData and insertBatch.
-var storedTip atomic.Uint64
+// storedRounds is the open DB's row count and last round (-1 when empty), so /v0/status and request
+// sizing needn't query: openDB sets it, insertBatch keeps it in step. A process serves one DB.
+type storedRounds struct{ n, hi int64 }
+
+var stored atomic.Pointer[storedRounds]
+
+// storedTip is the last stored round, 0 when empty.
+func storedTip() uint64 {
+	if s := stored.Load(); s != nil {
+		return uint64(max(s.hi, 0))
+	}
+	return 0
+}
 
 func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
 	var rnd, ts, tc, fees, txns, pp, arnd, vrnd []uint64
@@ -249,7 +266,11 @@ func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
 		return err
 	}
 	if err = tx.Commit(); err == nil {
-		storedTip.Store(rows[len(rows)-1].Rnd)
+		n := int64(len(rows))
+		if s := stored.Load(); s != nil {
+			n += s.n
+		}
+		stored.Store(&storedRounds{n, int64(rows[len(rows)-1].Rnd)})
 	}
 	return err
 }

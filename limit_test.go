@@ -11,7 +11,7 @@ import (
 )
 
 func TestRateLimit(t *testing.T) {
-	defer func(c limitConfig, tr config, tip uint64) { limits, track = c, tr; storedTip.Store(tip) }(limits, track, storedTip.Load())
+	defer func(c limitConfig, tr config, s *storedRounds) { limits, track = c, tr; stored.Store(s) }(limits, track, stored.Load())
 	track = config{Proposers: true}
 	db, err := openDB("", "test-v1")
 	if err != nil {
@@ -60,7 +60,7 @@ func TestRateLimit(t *testing.T) {
 	}
 
 	// Ranged routes are heavy only over heavyRounds: a recent window isn't, all of history is.
-	storedTip.Store(2 * heavyRounds)
+	stored.Store(&storedRounds{2 * heavyRounds, 2*heavyRounds - 1})
 	h = routes(db)
 	recent := fmt.Sprintf("/v0/proposers?minRound=%d", 2*heavyRounds-900000)
 	for i := range 20 {
