@@ -44,7 +44,7 @@ All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC 
 {"ok":1,"maxRound":46513899,"records":46513900,"proposers":true,"voterRounds":100000,"lsigs":true,"msigs":true}
 ```
 
-Sanity check: `records` should be `maxRound + 1` (round 0 is stored), or `maxRound + 1 - START_ROUND` for a trial.
+Sanity check: `records` should be `maxRound + 1` (round 0 is stored), or `maxRound + 1 - START_ROUND` for a trial. Both come from memory, not a query: counted when the DB opens, then kept in step with each insert.
 
 `proposers`, `voterRounds`, `lsigs` and `msigs` are the `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` this instance runs with. A feature that is off (`false`, or `voterRounds` 0) has no routes: they return 404. Clients should check these before calling the feature routes, since several of those also use 404 to mean "not seen".
 
@@ -203,7 +203,7 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 
 `/v0/delegations/<address>`: uses where the address is the `signer` or the `sender`: the lsigs it delegated, and those that moved it while rekeyed. `[]` if none.
 
-`/v0/templates`: templates with 2 or more programs, or delegated by 2 or more accounts, most programs first: `[{"template":"…","programs":1234,"delegators":0,"txns":56789,"firstRound":…,"lastRound":…}, ...]`. `delegators` counts the distinct signers. The list is cached for up to a minute (a smaller `limit` is its first rows); an [admin](#admin) rename clears the cache.
+`/v0/templates`: templates with 2 or more programs, or delegated by 2 or more accounts, most programs first: `[{"template":"…","programs":1234,"delegators":0,"txns":56789,"firstRound":…,"lastRound":…}, ...]`. `delegators` counts the distinct signers. The list is cached for up to a minute (a smaller `limit` is its first rows); an [admin](#admin) rename clears the cache, though clients may keep a reply for 10 s ([caching](#rate-limits)).
 
 `/v0/template/<id>`: `{"template":"…","name":null,"logic":"<base64>","programs":1234,"uses":[…]}`, or 404. `logic` is the first program seen of the template (disassemble it with `goal clerk compile -D`). `id` is 16 lowercase hex digits.
 
@@ -267,6 +267,8 @@ At most `HEAVY_CONCURRENCY` heavy requests query at once across all clients (def
 
 Every response, 429s and 503s included, carries `Access-Control-Allow-Origin: *` and exposes `Retry-After` and `X-Truncated` to browsers.
 
+A `GET` or `HEAD` that succeeds (200) carries `Cache-Control: public, max-age=10`, or `max-age=2` for `/v0/status`; any other reply carries `no-store`, so a 404 for an address not seen yet isn't kept. Browsers honour it. Cloudflare caches JSON only with a Cache Rule making the API hostname eligible for cache, and then it can also answer crawlers that request the same URLs. For the rule: Edge TTL *Use cache-control header if present*, Browser TTL *Respect origin TTL*, and keep the query string in the cache key (else `?ts=X` and `?ts=Y` share an entry). `/robots.txt` allows every crawler, and `/` answers 200.
+
 Behind a proxy every client shares the proxy's address, so set `REAL_IP_HEADER` to the header holding the visitor's IP, e.g. `CF-Connecting-IP` behind a Cloudflare Tunnel. It is read only from a loopback or private peer (cloudflared on the host, in docker or on the LAN), so a client reaching the port directly can't choose its own. A request from such a peer without a valid value is limited by the peer address, with a warning logged once. With Cloudflare, keep the zone's *Remove visitor IP headers* Managed Transform and *Pseudo IPv4* off: the first strips the header, the second puts a made-up IPv4 in it for IPv6 visitors.
 
 ## Running it
@@ -312,7 +314,7 @@ Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-i
 
 ### Running in production
 
-- The unit is `Type=notify`: `systemctl start` returns once the DB is open and the server listens, so a failed start or upgrade restart shows in `systemctl status`. Logs are JSON lines in the journal: `journalctl -u surf-indexer@mainnet-v1.0`.
+- The unit is `Type=notify`: `systemctl start` returns once the DB is open and the server listens, so a failed start or upgrade restart shows in `systemctl status`. Logs are JSON lines in the journal, timed in UTC (the unit sets `TZ=UTC`): `journalctl -u surf-indexer@mainnet-v1.0`. Each `inserted` line has the insert transaction's `insertMs`. One past 5 s means the DB stalled: an `insert slow` line is logged while it runs, and its `inserted` line has `"level":"WARN"` (in the JSON; the journal's own priority stays info).
 - Config errors exit with code 78, and the unit does not restart on it: a bad env file, a genesis ID algod doesn't report, or a DB of another network or synced with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`. Fix the cause, then `systemctl restart`. Other failures (algod down, disk) restart every 5 s.
 - Shutdown waits for the current ingest batch and DuckDB's checkpoint, up to 5 minutes.
 - Set `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` on a host shared with algod. For a hard cap on the whole process as well, add a drop-in: `sudo systemctl edit surf-indexer@mainnet-v1.0`, then `[Service]` and `MemoryMax=3G`, kept above `DUCKDB_MEMORY_LIMIT`.

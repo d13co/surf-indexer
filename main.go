@@ -93,8 +93,6 @@ func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 	} else if n > 0 && (lo != int64(startRound) || hi+1-lo != n) {
 		db.Close()
 		fatalConfig("db not contiguous from START_ROUND", "startRound", startRound, "records", n, "minRound", lo, "maxRound", hi)
-	} else {
-		storedTip.Store(uint64(max(hi, 0)))
 	}
 	return db
 }

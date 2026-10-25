@@ -190,15 +190,24 @@ func routes(db *sql.DB) http.Handler {
 	light := func(pattern string, h http.HandlerFunc) { mux.HandleFunc(pattern, h) }
 	heavy := func(pattern string, h http.HandlerFunc) { mux.HandleFunc(pattern, lim.heavy(h)) }
 
+	// Crawlers rendering algo.surf ask for these; answer them rather than 404.
+	light("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "surf-indexer: see /v0/status\n")
+	})
+	light("GET /robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "User-agent: *\nDisallow:\n")
+	})
+
 	light("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
-		n, _, hi, err := rounds(r.Context(), db)
+		// From memory, not a query: every algo.surf page asks for it.
+		s := stored.Load()
 		// The config says which feature routes exist: those off are 404s.
 		reply(w, r, struct {
 			OK       int   `json:"ok"`
 			MaxRound int64 `json:"maxRound"`
 			Records  int64 `json:"records"`
 			config
-		}{1, hi, n, track}, err)
+		}{1, s.hi, s.n, track}, nil)
 	})
 
 	light("GET /v0/block", func(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +310,7 @@ func routes(db *sql.DB) http.Handler {
 				}
 				args = append(args, a)
 			}
-			if top := min(hi, storedTip.Load()); top >= lo && top-lo >= heavyRounds {
+			if top := min(hi, storedTip()); top >= lo && top-lo >= heavyRounds {
 				var release func()
 				if r, release, ok = lim.admit(w, r); !ok {
 					return
@@ -489,7 +498,7 @@ func routes(db *sql.DB) http.Handler {
 				'uses': ` + uses("tmpl = $2") + `})::VARCHAR FROM lsig_templates WHERE tmpl = $2`, args, nil
 		})
 		if adminToken != "" {
-			adminRoutes(mux, db, templates.clear) // a rename shows at once
+			adminRoutes(mux, db, templates.clear) // a rename shows here at once; clients may cache 10 s
 		}
 	}
 	if track.Msigs {
@@ -543,7 +552,12 @@ func routes(db *sql.DB) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t, sw, key := time.Now(), &statusWriter{w, http.StatusOK}, lim.clientKey(r)
+		t, sw, key := time.Now(), &statusWriter{ResponseWriter: w, status: http.StatusOK, cache: cacheFor(r)}, lim.clientKey(r)
+		if sw.cache != "" {
+			// Any reply but a 200, an empty one included, says so: a cache keeps an unmarked 404 for
+			// minutes (Cloudflare's default), and a "not seen" address may be seen next block.
+			sw.Header().Set("Cache-Control", "no-store")
+		}
 		// Set before any reply, 429s and 503s included, or browsers hide them from algo.surf.
 		sw.Header().Set("Access-Control-Allow-Origin", "*")
 		sw.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Truncated")
@@ -559,13 +573,40 @@ func routes(db *sql.DB) http.Handler {
 	})
 }
 
-// statusWriter records the status code for the request log.
+// cacheFor is the Cache-Control a GET's (or HEAD's) 200 gets, so browsers and a caching proxy can
+// answer repeats. The tip moves every ~3 s: status is kept for 2 s, the rest for 10 s.
+func cacheFor(r *http.Request) string {
+	switch {
+	case r.Method != http.MethodGet && r.Method != http.MethodHead:
+		return ""
+	case r.URL.Path == "/v0/status":
+		return "public, max-age=2"
+	}
+	return "public, max-age=10"
+}
+
+// statusWriter records the first status code for the request log, and turns a 200's no-store into
+// cache.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	cache  string
+	wrote  bool
 }
 
 func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
+	if !w.wrote {
+		if code == http.StatusOK && w.cache != "" {
+			w.Header().Set("Cache-Control", w.cache)
+		}
+		w.status, w.wrote = code, true
+	}
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
 }

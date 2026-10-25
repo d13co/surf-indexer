@@ -571,6 +571,121 @@ func TestRequestLog(t *testing.T) {
 	}
 }
 
+// TestCacheControl checks that only a GET's or HEAD's 200 is cacheable, and that / and /robots.txt answer.
+func TestCacheControl(t *testing.T) {
+	defer func(c limitConfig) { limits = c }(limits)
+	limits = limitConfig{Rate: 1}
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	h := routes(db)
+	for i, c := range []struct {
+		method, url string
+		code        int
+		cache, body string
+	}{
+		{"GET", "/v0/status", 200, "public, max-age=2", ""},
+		{"HEAD", "/v0/status", 200, "public, max-age=2", ""},
+		{"GET", "/v0/upgrades", 200, "public, max-age=10", ""},
+		{"GET", "/v0/series?interval=second", 400, "no-store", ""},
+		{"GET", "/v0/block?ts=100", 404, "no-store", ""}, // not seen: none stored
+		{"GET", "/v0/nope", 404, "no-store", ""},
+		{"GET", "/", 200, "public, max-age=10", "surf-indexer: see /v0/status\n"},
+		{"GET", "/robots.txt", 200, "public, max-age=10", "User-agent: *\nDisallow:\n"},
+		{"PUT", "/v0/admin/template/x", 404, "", ""},
+		{"GET", "/v0/status", 429, "no-store", ""},
+	} {
+		r := httptest.NewRequest(c.method, c.url, nil)
+		r.RemoteAddr = fmt.Sprintf("192.0.2.%d:1", i) // a bucket each
+		w := httptest.NewRecorder()
+		if c.code == 429 {
+			for range 5 { // the burst
+				h.ServeHTTP(httptest.NewRecorder(), r)
+			}
+		}
+		h.ServeHTTP(w, r)
+		if w.Code != c.code || w.Header().Get("Cache-Control") != c.cache || (c.body != "" && w.Body.String() != c.body) {
+			t.Errorf("%s %s = %d %q %q, want %d %q %q", c.method, c.url, w.Code, w.Header().Get("Cache-Control"), w.Body, c.code, c.cache, c.body)
+		}
+	}
+}
+
+// TestStatus checks that /v0/status follows inserts without querying.
+func TestStatus(t *testing.T) {
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	h := routes(db)
+	get := func() (s struct{ MaxRound, Records int64 }) {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/v0/status", nil))
+		if err := json.Unmarshal(w.Body.Bytes(), &s); err != nil {
+			t.Fatal(w.Body, err)
+		}
+		return s
+	}
+	if s := get(); s.MaxRound != -1 || s.Records != 0 {
+		t.Errorf("empty status = %+v, want maxRound -1, records 0", s)
+	}
+	for _, rows := range [][]block{{row(0, 100, 0, 0), row(1, 110, 0, 0)}, {row(2, 120, 0, 0)}} {
+		if err := insertBatch(context.Background(), db, rows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s := get(); s.MaxRound != 2 || s.Records != 3 {
+		t.Errorf("status = %+v, want maxRound 2, records 3", s)
+	}
+}
+
+// TestInsertedLog checks that each batch's log line has its insert time, as a warning when slow.
+func TestInsertedLog(t *testing.T) {
+	var buf bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	defer log.SetFlags(log.Flags())
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	defer func(c config, d time.Duration) { track, slowInsert = c, d }(track, slowInsert)
+	track = config{}
+	blocks := []blockCert{mk(0, false), mk(1, false)}
+	var headerOnly atomic.Int32
+	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1")
+	db, err := openDB("", "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, want := range []string{"INFO", "WARN"} {
+		buf.Reset()
+		if _, err := syncToTip(context.Background(), db, src, 1, 5); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for l := range strings.Lines(buf.String()) {
+			var got struct {
+				Level, Msg string
+				To         int
+				InsertMs   *float64
+			}
+			if json.Unmarshal([]byte(l), &got) != nil || got.Msg != "inserted" {
+				continue
+			}
+			found = true
+			if got.Level != want || got.InsertMs == nil || *got.InsertMs <= 0 || got.To != len(blocks)-1 {
+				t.Errorf("inserted log = %s, want %s with insertMs > 0, to round %d", l, want, len(blocks)-1)
+			}
+		}
+		if !found {
+			t.Errorf("no inserted log in %s", buf.String())
+		}
+		slowInsert = 0 // every insert is slow: the next batch's line is a warning
+		blocks = append(blocks, mk(len(blocks), false))
+	}
+}
+
 func TestParseTime(t *testing.T) {
 	want := uint64(time.Date(2025, 10, 6, 0, 0, 0, 0, time.UTC).Unix())
 	for _, s := range []string{"1759708800", "2025-10-06", "2025-10-06T00:00:00Z", "2025-10-06T02:00:00+02:00"} {

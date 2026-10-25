@@ -21,6 +21,11 @@ type algods []*algod.Client
 
 var retryWait = 2800 * time.Millisecond // a var so tests can skip the waits
 
+// slowInsert is how long a batch's insert transaction may take before it's warned of, while it runs
+// and on its inserted line. At the tip one takes milliseconds; much longer means the DB stalled (a
+// checkpoint, the disk). A var so tests can set it.
+var slowInsert = 5 * time.Second
+
 func sleep(ctx context.Context, d time.Duration) {
 	select {
 	case <-ctx.Done():
@@ -221,14 +226,25 @@ func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chu
 		if err := g.Wait(); err != nil {
 			return 0, err
 		}
-		if err := insertBatch(ctx, db, rows); err != nil {
-			return 0, err
+		ins, from, to, n := time.Now(), next, end, len(rows)
+		// Warns during a stall too: the inserted line only comes once it's over.
+		watch := time.AfterFunc(slowInsert, func() { slog.Warn("insert slow", "from", from, "to", to, "blocks", n, "after", slowInsert.String()) })
+		err := insertBatch(ctx, db, rows)
+		watch.Stop()
+		took := time.Since(ins)
+		if err != nil {
+			return 0, fmt.Errorf("insert %d-%d after %s: %w", from, to, took.Round(time.Millisecond), err)
 		}
-		attrs := []any{"from", next, "to", end, "blocks", len(rows), "headerOnly", payouts.Load() && !track.fullBlocks()}
+		attrs := []any{"from", next, "to", end, "blocks", len(rows), "headerOnly", payouts.Load() && !track.fullBlocks(),
+			"insertMs", float64(took.Microseconds()) / 1000}
 		if next != tip { // at tip one block arrives per long-poll, so a rate would only be fetch+insert latency
 			attrs = append(attrs, "blkPerSec", math.Round(float64(len(rows))/time.Since(start).Seconds()))
 		}
-		slog.Info("inserted", attrs...)
+		level := slog.LevelInfo
+		if took > slowInsert {
+			level = slog.LevelWarn
+		}
+		slog.Log(ctx, level, "inserted", attrs...)
 		next = end + 1
 	}
 	return min(next-1, tip), nil // a START_ROUND past the tip stored nothing yet

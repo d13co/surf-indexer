@@ -16,6 +16,8 @@ Wants=network-online.target
 Type=notify
 User=surf-indexer
 Group=surf-indexer
+# Log times in UTC: local time repeats an hour when DST ends.
+Environment=TZ=UTC
 EnvironmentFile=/etc/surf-indexer/%i.env
 ExecStart=/usr/bin/surf-indexer %i $DB_ID
 StateDirectory=surf-indexer
