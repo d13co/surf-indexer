@@ -59,7 +59,9 @@ func lsigUses(b types.Block) (uses []lsigUse) {
 // immBytes is the fixed immediate size of each opcode a lsig may use, from go-algorand's
 // langspec_v1..v13.json (app-only ops fail the static check in a lsig); the rest take none.
 // The variable-length ops, and branches (whose offsets changed encoding in v13), are in template's switch.
-var immBytes = func() (t [256]uint8) {
+// immBytesV14 adds the v14 ones: falcon_verify's FalconConfigs field, and rsa_verify (experimental;
+// there is no op at 0xe8 before it).
+var immBytes, immBytesV14 = func() (t [256]uint8) {
 	for _, op := range []byte{0x05, 0x06, 0x07, 0x21, 0x27, 0x2c, 0x31, 0x32, 0x34, 0x35, 0x38, 0x45, 0x46, 0x47,
 		0x4b, 0x4e, 0x4f, 0x5c, 0x5e, 0x5f, 0x8b, 0x8c, 0xc0, 0xc2, 0xd0, 0xd1, 0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7} {
 		t[op] = 1
@@ -69,6 +71,10 @@ var immBytes = func() (t [256]uint8) {
 	}
 	t[0x37] = 3
 	return t
+}(), func() (t [256]uint8) {
+	t = immBytes
+	t[0x85], t[0xe8] = 1, 1
+	return t
 }()
 
 // template ids a lsig program's template: the hash of its skeleton, which keeps opcodes and fixed
@@ -76,14 +82,20 @@ var immBytes = func() (t [256]uint8) {
 // (an inline constant of another length shifts them). Programs instantiated from one template with
 // other values (TMPL_ vars, per-user escrows) share it. It says nothing about the values or branch
 // targets, so it never makes a lsig genuine: anyone can fill a template with their own.
+//
+// The spec is @node-toolkit/core's templateId (skeleton.ts); testdata/template-ids.json is a copy
+// of its vectors, which TestTemplateSpec checks. Change both together.
 func template(logic []byte) string {
 	ver, pc := binary.Uvarint(logic)
-	// ponytail: immBytes knows versions up to 13 (consensus v42); v14 is still vFuture, where
-	// falcon_verify gains a field and rsa_verify is added. A newer version is its own template until
-	// added. Any change here changes stored ids, so it needs a LEDGER_DB rebuild.
-	skel, ok := []byte("S"), pc > 0 && ver <= 13
+	// immBytes knows versions up to 14. A newer version is its own template until added. Any change
+	// here changes stored ids, so it needs a LEDGER_DB rebuild.
+	skel, ok := []byte("S"), pc > 0 && ver <= 14
 	if ok {
 		skel = append(skel, logic[:pc]...)
+	}
+	imm := &immBytes
+	if ver >= 14 {
+		imm = &immBytesV14
 	}
 	// uvarint reads a varuint at pc; ok goes false if there is none.
 	uvarint := func() uint64 {
@@ -134,10 +146,10 @@ func template(logic []byte) string {
 			value(op == 0x80)
 		case 0x21, 0x22, 0x23, 0x24, 0x25: // intc, intc_0..3
 			skel[len(skel)-1] = 0x81
-			skip(uint64(immBytes[op]))
+			skip(uint64(imm[op]))
 		case 0x27, 0x28, 0x29, 0x2a, 0x2b: // bytec, bytec_0..3
 			skel[len(skel)-1] = 0x80
-			skip(uint64(immBytes[op]))
+			skip(uint64(imm[op]))
 		case 0x40, 0x41, 0x42, 0x88: // bnz, bz, b, callsub: int16 offset, a zigzag varint from v13
 			if ver < 13 {
 				skip(2)
@@ -153,7 +165,7 @@ func template(logic []byte) string {
 			}
 		default:
 			start := pc
-			if skip(uint64(immBytes[op])); ok {
+			if skip(uint64(imm[op])); ok {
 				skel = append(skel, logic[start:pc]...)
 			}
 		}
