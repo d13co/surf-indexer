@@ -15,6 +15,7 @@ import (
 	"github.com/algorand/go-algorand-sdk/v2/encoding/msgpack"
 	"github.com/algorand/go-algorand-sdk/v2/types"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
 
 type algods []*algod.Client
@@ -96,10 +97,16 @@ type source struct {
 	tip func(ctx context.Context, next uint64) (uint64, error)
 }
 
-func algodSource(a algods, genesisID string) source {
+// algodSource fetches from a. lim, if set, is waited on before each attempt, retries included.
+func algodSource(a algods, genesisID string, lim *rate.Limiter) source {
 	return source{
 		get: func(ctx context.Context, rnd uint64, headerOnly, cert bool) (blockCert, error) {
 			return call(ctx, a, func(c *algod.Client) (b blockCert, err error) {
+				if lim != nil {
+					if err = lim.Wait(ctx); err != nil {
+						return b, err
+					}
+				}
 				if headerOnly && !cert {
 					b.Block, err = c.Block(rnd).HeaderOnly(true).Do(ctx)
 				} else { // only a full msgpack response carries the cert; decoded as the SDK does
@@ -177,6 +184,9 @@ func fetchBlock(ctx context.Context, src source, rnd uint64, voters bool) (block
 	if track.Msigs {
 		blk.msigs = msigUses(b.Block)
 	}
+	for _, j := range trackedJobs() {
+		j.extract(b, &blk)
+	}
 	return blk, nil
 }
 
@@ -226,17 +236,25 @@ func syncToTip(ctx context.Context, db *sql.DB, src source, concurrency int, chu
 		if err := g.Wait(); err != nil {
 			return 0, err
 		}
+		// The wait for the backfill's commit is timed apart, so it isn't reported as a slow insert.
+		lock := time.Now()
+		writeMu.Lock()
 		ins, from, to, n := time.Now(), next, end, len(rows)
+		waited := ins.Sub(lock)
 		// Warns during a stall too: the inserted line only comes once it's over.
 		watch := time.AfterFunc(slowInsert, func() { slog.Warn("insert slow", "from", from, "to", to, "blocks", n, "after", slowInsert.String()) })
-		err := insertBatch(ctx, db, rows)
+		err := insertLocked(ctx, db, rows)
 		watch.Stop()
+		writeMu.Unlock()
 		took := time.Since(ins)
 		if err != nil {
 			return 0, fmt.Errorf("insert %d-%d after %s: %w", from, to, took.Round(time.Millisecond), err)
 		}
 		attrs := []any{"from", next, "to", end, "blocks", len(rows), "headerOnly", payouts.Load() && !track.fullBlocks(),
 			"insertMs", float64(took.Microseconds()) / 1000}
+		if waited >= time.Millisecond {
+			attrs = append(attrs, "lockWaitMs", float64(waited.Microseconds())/1000)
+		}
 		if next != tip { // at tip one block arrives per long-poll, so a rate would only be fetch+insert latency
 			attrs = append(attrs, "blkPerSec", math.Round(float64(len(rows))/time.Since(start).Seconds()))
 		}

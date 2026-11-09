@@ -207,7 +207,7 @@ func TestSyncToTip(t *testing.T) {
 	defer func(d time.Duration) { retryWait = d }(retryWait)
 	retryWait = 0 // the cert guards fail after call's retries
 	defer func(c config) { track = c }(track)
-	for _, track = range []config{{Proposers: true}, {}, {Proposers: true, Lsigs: true}, {Msigs: true}, {Lsigs: true, Msigs: true}} {
+	for _, track = range []config{{Proposers: true}, {}, {Proposers: true, Lsigs: true}, {Msigs: true}, {Lsigs: true, Msigs: true}, {Rekeys: true}} {
 		t.Run(fmt.Sprint(track), func(t *testing.T) {
 			ctx := context.Background()
 			var blocks []blockCert
@@ -224,7 +224,7 @@ func TestSyncToTip(t *testing.T) {
 			payouts.Store(false)
 			// Batches of 5, fetched one at a time: 0-4 full, 5 full (flips payouts), 6-9 header-only
 			// unless lsigs need every payset.
-			if hi, err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5); err != nil || hi != 9 {
+			if hi, err := syncToTip(ctx, db, algodSource(algods{good}, "test-v1", nil), 1, 5); err != nil || hi != 9 {
 				t.Fatal(hi, err)
 			}
 			want := int32(4)
@@ -244,7 +244,7 @@ func TestSyncToTip(t *testing.T) {
 				stripped[i].Cert = blockCert{}.Cert
 			}
 			noCert := fakeAlgod(t, "test-v1", &stripped, &headerOnly)
-			if hi, err := syncToTip(ctx, db, algodSource(algods{wrong, noCert, good}, "test-v1"), 1, 5); err != nil || hi != 10 {
+			if hi, err := syncToTip(ctx, db, algodSource(algods{wrong, noCert, good}, "test-v1", nil), 1, 5); err != nil || hi != 10 {
 				t.Fatal(hi, err)
 			}
 			checkFees(t, db)
@@ -255,7 +255,7 @@ func TestSyncToTip(t *testing.T) {
 			// A cert that decodes to no proposer fails the sync rather than storing NULL.
 			blocks = append(blocks, mk(11, false))
 			blocks[11].Cert.Prop.OProp = types.Address{}
-			_, err = syncToTip(ctx, db, algodSource(algods{good}, "test-v1"), 1, 5)
+			_, err = syncToTip(ctx, db, algodSource(algods{good}, "test-v1", nil), 1, 5)
 			if (err != nil) != track.Proposers {
 				t.Errorf("sync with no oprop: %v", err)
 			}
@@ -275,7 +275,7 @@ func TestVoterWindow(t *testing.T) {
 		blocks = append(blocks, mk(r, r >= 5))
 	}
 	var headerOnly atomic.Int32
-	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1")
+	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1", nil)
 	db, err := openDB("", "test-v1")
 	if err != nil {
 		t.Fatal(err)
@@ -652,7 +652,7 @@ func TestInsertedLog(t *testing.T) {
 	track = config{}
 	blocks := []blockCert{mk(0, false), mk(1, false)}
 	var headerOnly atomic.Int32
-	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1")
+	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1", nil)
 	db, err := openDB("", "test-v1")
 	if err != nil {
 		t.Fatal(err)
@@ -805,7 +805,8 @@ func TestOpenDBConfig(t *testing.T) {
 		if err == nil {
 			var got config
 			err := db.QueryRow(`SELECT *, (SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'lsigs'),
-				(SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'msig_signers') FROM config`).Scan(&got.Proposers, &got.VoterRounds, &got.Lsigs, &got.Msigs)
+				(SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'msig_signers'),
+				(SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'rekeys') FROM config`).Scan(&got.Proposers, &got.VoterRounds, &got.Lsigs, &got.Msigs, &got.Rekeys)
 			if err != nil || got != c {
 				t.Errorf("stored config = %+v %v, want %+v", got, err, c)
 			}
@@ -842,6 +843,14 @@ func TestOpenDBConfig(t *testing.T) {
 	refused(path, config{Proposers: true, VoterRounds: 3})
 	refused(path, config{})
 	refused(path, config{VoterRounds: 3, Lsigs: true})
+	// Rekeys alone may be turned on for a DB with blocks, but not back off.
+	if err := open(path, config{VoterRounds: 3, Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
+	refused(path, config{VoterRounds: 3})
+	if err := open(path, config{VoterRounds: 3, Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Lsigs, stored as the lsigs table's presence, toggles while empty and is then fixed both ways.
 	lpath := filepath.Join(dir, "lsigs.duckdb")
@@ -977,7 +986,7 @@ func TestProposerRoutes(t *testing.T) {
 		{"/v0/exists/@C", ok, `{"exists":true}`},
 		{"/v0/exists/@D", ok, `{"exists":false}`},
 		{"/v0/exists/nope", 400, ""},
-		{"/v0/status", ok, `{"ok":1,"maxRound":5,"records":6,"proposers":true,"voterRounds":100,"lsigs":false,"msigs":false}`},
+		{"/v0/status", ok, `{"ok":1,"maxRound":5,"records":6,"proposers":true,"voterRounds":100,"lsigs":false,"msigs":false,"rekeys":false}`},
 	} {
 		code, body := get(r.Replace(c.url))
 		if code != c.code || (c.code == ok && body != r.Replace(c.want)) {
@@ -1034,7 +1043,7 @@ func TestStartRound(t *testing.T) {
 		blocks = append(blocks, mk(r, false))
 	}
 	var headerOnly atomic.Int32
-	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1")
+	src := algodSource(algods{fakeAlgod(t, "test-v1", &blocks, &headerOnly)}, "test-v1", nil)
 	db, err := openDB("", "test-v1")
 	if err != nil {
 		t.Fatal(err)

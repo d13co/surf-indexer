@@ -37,7 +37,8 @@ func (e configErr) Unwrap() error { return e.error }
 // the README's table listing all of them.
 var knownEnv = []string{
 	"PORT", "LISTEN_ADDR", "ALGOD_HOST", "ALGOD_PORT", "ALGOD_TOKEN", "CONCURRENCY", "DB_CHUNKS",
-	"LEDGER_DB", "PROPOSERS", "VOTER_ROUNDS", "LSIGS", "MSIGS", "ADMIN_TOKEN", "RATE_LIMIT",
+	"LEDGER_DB", "PROPOSERS", "VOTER_ROUNDS", "LSIGS", "MSIGS", "REKEYS", "ADMIN_TOKEN", "RATE_LIMIT",
+	"BACKFILL_ALGOD_HOST", "BACKFILL_ALGOD_PORT", "BACKFILL_ALGOD_TOKEN", "BACKFILL_CONCURRENCY", "BACKFILL_RATE",
 	"HEAVY_CONCURRENCY", "REAL_IP_HEADER", "START_ROUND", "DUCKDB_MEMORY_LIMIT", "DUCKDB_THREADS",
 	"DB_ID", // read by the unit only, which passes it as the dbID argument
 }
@@ -50,8 +51,15 @@ type settings struct {
 	startRound         uint64
 	concurrency, chunk int
 	ledger             string
+	backfill           backfillConfig
 	listen             string     // host:port
 	dbOptions          url.Values // DuckDB config options
+}
+
+// backfillConfig is how fast the service's backfill runner fetches, from the BACKFILL_ALGOD_* algods
+// (algodClients). Live ingest keeps ALGOD_*, CONCURRENCY and DB_CHUNKS.
+type backfillConfig struct {
+	concurrency, rate int // fetches at once; blocks/s, 0 for no limit
 }
 
 // envReader reads typed variables, collecting every error rather than stopping at the first.
@@ -87,7 +95,7 @@ func (r *envReader) bool(name string, def bool) bool {
 func loadConfig() (s settings, err error) {
 	var r envReader
 	s.track = config{Proposers: r.bool("PROPOSERS", true), VoterRounds: uint64(r.int("VOTER_ROUNDS", 100000, 0, math.MaxUint32)),
-		Lsigs: r.bool("LSIGS", false), Msigs: r.bool("MSIGS", false)}
+		Lsigs: r.bool("LSIGS", false), Msigs: r.bool("MSIGS", false), Rekeys: r.bool("REKEYS", false)}
 	s.adminToken = os.Getenv("ADMIN_TOKEN")
 	if err := checkAdminToken(s.adminToken, s.track.Lsigs); err != nil {
 		r.errs = append(r.errs, fmt.Errorf("ADMIN_TOKEN: %w", err))
@@ -97,6 +105,8 @@ func loadConfig() (s settings, err error) {
 	s.startRound = uint64(r.int("START_ROUND", 0, 0, math.MaxUint32))
 	s.concurrency, s.chunk = r.int("CONCURRENCY", 10, 1, math.MaxInt), r.int("DB_CHUNKS", 1000, 1, math.MaxInt)
 	s.ledger = os.Getenv("LEDGER_DB")
+	// The default rate is gentle on a shared archival algod.
+	s.backfill = backfillConfig{concurrency: r.int("BACKFILL_CONCURRENCY", 4, 1, math.MaxInt), rate: r.int("BACKFILL_RATE", 100, 0, math.MaxInt)}
 	host := strings.TrimSuffix(strings.TrimPrefix(os.Getenv("LISTEN_ADDR"), "["), "]") // JoinHostPort adds an IPv6's brackets
 	s.listen = net.JoinHostPort(host, strconv.Itoa(r.int("PORT", 8118, 1, 65535)))
 
@@ -203,22 +213,55 @@ func check(args []string) int {
 		return 0
 	}
 
-	a, err := algodClients(s.concurrency)
+	a, err := algodClients(false, s.concurrency)
 	if err != nil {
 		return fail(exitConfig, "algod config", err)
 	}
 	code := 0
-	for i, c := range a { // each on its own, so a dead failover algod shows too
+	// checkAlgods checks each of a on its own, so a dead failover algod shows too.
+	checkAlgods := func(name string, a algods) {
+		for i, c := range a {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			p, err := c.SuggestedParams().Do(ctx)
+			cancel()
+			switch {
+			case err != nil:
+				code = max(code, fail(1, fmt.Sprintf("%s %d", name, i), err))
+			case p.GenesisID != genesisID:
+				code = fail(exitConfig, fmt.Sprintf("%s %d", name, i), fmt.Errorf("genesis ID is %s, not %s", p.GenesisID, genesisID))
+			default:
+				fmt.Printf("ok   %s %d: %s at round %d\n", name, i, p.GenesisID, p.FirstRoundValid)
+			}
+		}
+	}
+	checkAlgods("algod", a)
+	jobs := trackedJobsOf(s.track)
+	if len(jobs) == 0 {
+		return code
+	}
+	// The backfill needs rounds from the first a tracked feature can hold (genesis has no txns, so
+	// round 1 at the earliest), so its algods must be archival back to there: a pruned node would fail
+	// every chunk, forever.
+	first := uint64(math.MaxUint64)
+	for _, j := range jobs {
+		first = min(first, max(j.from(genesisID), 1))
+	}
+	b := a // the ALGOD_* algods, already checked above
+	if backfillAlgodSet() {
+		if b, err = algodClients(true, s.backfill.concurrency); err != nil {
+			return fail(exitConfig, "backfill algod config", err)
+		}
+		checkAlgods("backfill algod", b)
+	}
+	for i, c := range b { // each on its own, so a pruned failover algod shows too
+		name := fmt.Sprintf("backfill algod %d", i)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		p, err := c.SuggestedParams().Do(ctx)
+		_, err := algodSource(algods{c}, genesisID, nil).get(ctx, first, true, false) // checks the genesis ID too
 		cancel()
-		switch {
-		case err != nil:
-			code = max(code, fail(1, fmt.Sprintf("algod %d", i), err))
-		case p.GenesisID != genesisID:
-			code = fail(exitConfig, fmt.Sprintf("algod %d", i), fmt.Errorf("genesis ID is %s, not %s", p.GenesisID, genesisID))
-		default:
-			fmt.Printf("ok   algod %d: %s at round %d\n", i, p.GenesisID, p.FirstRoundValid)
+		if err != nil {
+			code = max(code, fail(1, name, fmt.Errorf("round %d, the first the backfill may need: %w (is it archival?)", first, err)))
+		} else {
+			fmt.Printf("ok   %s: holds round %d\n", name, first)
 		}
 	}
 	return code

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS upgrades(
 	switch_ts UINTEGER                  -- NULL until applied
 );
 CREATE TABLE IF NOT EXISTS upgrade_sync(next_sample UINTEGER NOT NULL);
-INSERT INTO upgrade_sync SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM upgrade_sync)`
+INSERT INTO upgrade_sync SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM upgrade_sync);
+` + backfillTables
 
 type block struct {
 	Rnd  uint64 `json:"rnd"`
@@ -49,19 +50,28 @@ type block struct {
 	absent, voters []string
 	lsigs          []lsigUse
 	msigs          []msigUse
+	rekeys         []rekeyUse
 }
 
-// config is what a DB tracks besides fees. It is fixed once the DB holds a block.
+// config is what a DB tracks besides fees. It is fixed once the DB holds a block, but for the
+// backfillable features (backfill.go), which can be turned on later.
 // Each field also gates its routes; /v0/status reports them under the json names.
 type config struct {
 	Proposers   bool   `json:"proposers"`   // proposer, payout and absent accounts per block
 	VoterRounds uint64 `json:"voterRounds"` // cert voters of the last VoterRounds rounds; 0: none
 	Lsigs       bool   `json:"lsigs"`       // lsig programs, delegators, rekeyed senders and templates (lsigs, lsig_templates)
 	Msigs       bool   `json:"msigs"`       // multisig subsigners (msig_signers)
+	Rekeys      bool   `json:"rekeys"`      // rekeys per account and authorizer (rekeys); backfillable
 }
 
 // fullBlocks is whether every round needs its payset.
-func (c config) fullBlocks() bool { return c.Lsigs || c.Msigs }
+func (c config) fullBlocks() bool { return c.Lsigs || c.Msigs || c.Rekeys }
+
+// fixed is c without its backfillable features: what a DB with blocks can't change.
+func (c config) fixed() config {
+	c.Rekeys = false
+	return c
+}
 
 // lsigTables are kept out of schema: the presence of lsigs is the stored Lsigs flag, which an older
 // binary ignores (a config column would break its INSERT INTO config), though its ingest leaves a gap.
@@ -120,6 +130,10 @@ func openDB(path, genesisID string) (*sql.DB, error) {
 		return nil, err
 	}
 	stored.Store(&storedRounds{n, hi})
+	if err = loadLeft(context.Background(), db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return db, nil
 }
 
@@ -133,6 +147,7 @@ func setup(db *sql.DB, path, genesisID string) error {
 	defer tx.Rollback()
 	var stored string
 	var legacy, hasBlocks bool
+	var lo, hi int64
 	var have config // a DB without a config row (new, or from before config) tracked nothing
 	if _, err = tx.Exec(schema); err == nil {
 		_, err = tx.Exec("INSERT INTO meta SELECT ? WHERE NOT EXISTS (SELECT 1 FROM meta)", genesisID)
@@ -159,13 +174,13 @@ func setup(db *sql.DB, path, genesisID string) error {
 		err = tx.QueryRow("SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'msig_signers'").Scan(&have.Msigs)
 	}
 	if err == nil {
-		err = tx.QueryRow("SELECT count(*) > 0 FROM blocks").Scan(&hasBlocks)
+		err = tx.QueryRow("SELECT count(*) > 0, coalesce(min(rnd), 0), coalesce(max(rnd), -1) FROM blocks").Scan(&hasBlocks, &lo, &hi)
 	}
 	if err != nil {
 		return err
 	}
-	if hasBlocks && have != track {
-		return configErr{fmt.Errorf("%s was synced with PROPOSERS=%t VOTER_ROUNDS=%d LSIGS=%t MSIGS=%t: run with those, or rebuild into a new file (LEDGER_DB) to change them",
+	if hasBlocks && have != track.fixed() {
+		return configErr{fmt.Errorf("%s was synced with PROPOSERS=%t VOTER_ROUNDS=%d LSIGS=%t MSIGS=%t: run with those, or rebuild into a new file (LEDGER_DB) to change them (REKEYS alone can be turned on later)",
 			path, have.Proposers, have.VoterRounds, have.Lsigs, have.Msigs)}
 	}
 	if legacy {
@@ -185,6 +200,11 @@ func setup(db *sql.DB, path, genesisID string) error {
 		_, err = tx.Exec(msigTable)
 	} else if err == nil {
 		_, err = tx.Exec("DROP TABLE IF EXISTS msig_signers")
+	}
+	for _, j := range allJobs {
+		if err == nil {
+			err = setupJob(tx, j, path, genesisID, lo, hi)
+		}
 	}
 	if err == nil {
 		_, err = tx.Exec("DELETE FROM config")
@@ -222,6 +242,13 @@ func storedTip() uint64 {
 }
 
 func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	return insertLocked(ctx, db, rows)
+}
+
+// insertLocked is insertBatch for a caller that holds writeMu.
+func insertLocked(ctx context.Context, db *sql.DB, rows []block) error {
 	var rnd, ts, tc, fees, txns, pp, arnd, vrnd []uint64
 	var prop, absent, voters []string
 	for _, r := range rows {
@@ -258,8 +285,17 @@ func insertBatch(ctx context.Context, db *sql.DB, rows []block) error {
 	if err == nil && track.Msigs {
 		err = mergeMsigs(ctx, tx, rows)
 	}
+	last := rows[len(rows)-1].Rnd
+	for _, j := range trackedJobs() { // next moves with the rows, so the two never disagree
+		if err == nil {
+			err = j.merge(ctx, tx, rows)
+		}
+		if err == nil {
+			_, err = tx.ExecContext(ctx, "UPDATE feature_sync SET next = greatest(next, ?) WHERE feature = ?", last+1, j.feature)
+		}
+	}
 	// Rows are in rnd order, so whole row groups empty out and are reclaimed at checkpoint.
-	if last := rows[len(rows)-1].Rnd; err == nil && track.VoterRounds > 0 && last >= track.VoterRounds {
+	if err == nil && track.VoterRounds > 0 && last >= track.VoterRounds {
 		_, err = tx.ExecContext(ctx, "DELETE FROM voters WHERE rnd <= ?", last-track.VoterRounds)
 	}
 	if err != nil {
