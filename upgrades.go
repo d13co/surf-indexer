@@ -101,6 +101,8 @@ func upgradeStep(ctx context.Context, db *sql.DB, src source, concurrency int, h
 	if nextSample == next && len(changed) == 0 {
 		return next, nil
 	}
+	writeMu.Lock()
+	defer writeMu.Unlock()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err

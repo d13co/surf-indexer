@@ -1,6 +1,6 @@
 # surf-indexer
 
-An HTTP API over the full block history of one Algorand network. Find the block at a given time or txn counter, sum fees over any range, chart fees and TPS, and follow consensus upgrades. Optional modules add block proposers, payouts and evictions, cert voters, logic sig and delegation lookups, and multisig subsigners.
+An HTTP API over the full block history of one Algorand network. Find the block at a given time or txn counter, sum fees over any range, chart fees and TPS, and follow consensus upgrades. Optional modules add block proposers, payouts and evictions, cert voters, logic sig and delegation lookups, multisig subsigners, and rekey history.
 
 It keeps everything in a single DuckDB file, filled from an archival algod (or straight from its ledger DB for a fast first load), and follows the chain tip block by block.
 
@@ -18,7 +18,8 @@ API should be considered **unstable**.
 | [Voters](#proposers-and-voters) | Who voted in block certs over a recent window, and in which rounds | `VOTER_ROUNDS` (100000) | `/v0/voters`, `/v0/voter/<address>`; `/v0/exists/<address>` with either |
 | [Logic sigs](#logic-sigs) | Which logic sigs an account delegated or was moved by, how much each was used, and which share a template | `LSIGS` (off) | `/v0/lsig/<address>`, `/v0/delegations/<address>`, `/v0/templates`, `/v0/template/<id>` |
 | [Multisig subsigners](#multisig-subsigners) | Which multisigs a key belongs to, the subsigners of a multisig, and whether each key ever signed | `MSIGS` (off) | `/v0/subsigner/<address>`, `/v0/msig/<address>` |
-| [Account summary](#account-summary) | What every enabled feature knows of an address, in one request | any of the four above | `/v0/account/<address>` |
+| [Rekeys](#rekeys) | Every authorizer an account was ever rekeyed to, and every account ever rekeyed to an address, with first and last round and count | `REKEYS` (off) | `/v0/rekeys/<address>` |
+| [Account summary](#account-summary) | What every enabled feature knows of an address, in one request | any of the five above | `/v0/account/<address>` |
 | [Admin](#admin) | Name logic sig templates (e.g. "Tinyman v1 pool") | `ADMIN_TOKEN` | `PUT`/`DELETE /v0/admin/template/<id>` |
 
 [`/v0/status`](#status) reports the tip and which features this instance runs with. Every response allows any origin (`Access-Control-Allow-Origin: *`), so browsers can call it directly, and clients are [rate limited](#rate-limits) per IP.
@@ -46,7 +47,9 @@ All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC 
 
 Sanity check: `records` should be `maxRound + 1` (round 0 is stored), or `maxRound + 1 - START_ROUND` for a trial. Both come from memory, not a query: counted when the DB opens, then kept in step with each insert.
 
-`proposers`, `voterRounds`, `lsigs` and `msigs` are the `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` this instance runs with. A feature that is off (`false`, or `voterRounds` 0) has no routes: they return 404. Clients should check these before calling the feature routes, since several of those also use 404 to mean "not seen".
+`proposers`, `voterRounds`, `lsigs`, `msigs` and `rekeys` are the `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS`, `MSIGS` and `REKEYS` this instance runs with. A feature that is off (`false`, or `voterRounds` 0) has no routes: they return 404. Clients should check these before calling the feature routes, since several of those also use 404 to mean "not seen".
+
+`rekeys` can be turned on for a DB that already holds blocks, which [backfills](#backfill) its history in the background. Until that is done it reads `false` and its routes 404, and `backfill` says how far it has to go: `{…,"rekeys":false,"backfill":{"rekeys":{"roundsLeft":12345678}}}`. `backfill` is left out when nothing is backfilling.
 
 ### Block lookup
 
@@ -228,6 +231,25 @@ Every multisig that authorized a top-level txn is indexed (inner txns have none)
 
 A multisig preimage this build can't read (a new msig version, or a key that isn't 32 bytes) is skipped with an `msig skipped` warning in the log, leaving a gap: upgrade the binary and rebuild if that appears.
 
+### Rekeys
+
+This route exists only with `REKEYS` on, and serves once its history is [backfilled](#backfill); until then it 404s.
+
+Every change of an account's authorizer is indexed, inner txns included (apps rekey the escrows they create): a txn with `rekey-to`, and a close-out (a payment with `close-remainder-to`) of a rekeyed account, which deletes the account and with it its authorizer. There is one row per account and authorizer, without per-txn history. A rekey back to the account's own key, and a close-out that cleared a rekey, are a row whose authorizer is the account itself. A close-out of an account that was never rekeyed changes nothing and isn't stored, nor is an asset close-out. Rounds only: `/v0/round/<rnd>` gives the time.
+
+`/v0/rekeys/<address>`:
+
+```
+{"to":[{"address":"AUTH…","txns":2,"firstRound":31000000,"lastRound":45000000}, …],
+ "from":[{"address":"ACCT…","txns":1,"firstRound":40000000,"lastRound":40000000}, …]}
+```
+
+- `to`: the authorizers the account was rekeyed to. An entry whose `address` is the account itself counts its rekeys back to its own key and its close-outs while rekeyed.
+- `from`: the accounts rekeyed to this address.
+- `txns`: the txns that set the account's authorizer to `address`. `firstRound`, `lastRound`: the first and last of them. Round and sender (and `rekey-to`) find a txn in an indexer.
+
+Each list is newest `lastRound` first and capped by `limit` (default 1000, at most 100000). An address never seen gets `{"to":[],"from":[]}`. The current authorizer is algod's (`auth-addr` on the account): two changes in one round aren't ordered here.
+
 ### Account summary
 
 `/v0/account/<address>`: what each tracked feature knows of an address, in one request (~40–50 ms on mainnet), for a client to choose what to fetch next:
@@ -242,8 +264,9 @@ A multisig preimage this build can't read (a new msig version, or a key that isn
 - `signers`: the number of subsigners if it is a multisig, as `/v0/msig/<address>` lists before its `limit` (`MSIGS`)
 - `proposed`, `evicted`: whether it ever proposed a stored block or was evicted (`PROPOSERS`)
 - `voted`: whether it voted in the window (`VOTER_ROUNDS` above 0)
+- `rekeysTo`, `rekeysFrom`: the number of entries `/v0/rekeys/<address>` lists in `to` and `from`, before its `limit` (`REKEYS`, once backfilled)
 
-Keys of features that are off are left out, and an address never seen gets zeros and `false`. With all four off the route 404s. Not ranged and never heavy.
+Keys of features that are off, or still backfilling, are left out, and an address never seen gets zeros and `false`. With all five off the route 404s, and with only `REKEYS` on it 404s until backfilled. Not ranged and never heavy.
 
 ### Admin
 
@@ -315,7 +338,7 @@ Its DB is `/var/lib/surf-indexer/data/mainnet-v1.0.duckdb`, owned by the `surf-i
 ### Running in production
 
 - The unit is `Type=notify`: `systemctl start` returns once the DB is open and the server listens, so a failed start or upgrade restart shows in `systemctl status`. Logs are JSON lines in the journal, timed in UTC (the unit sets `TZ=UTC`): `journalctl -u surf-indexer@mainnet-v1.0`. Each `inserted` line has the insert transaction's `insertMs`. One past 5 s means the DB stalled: an `insert slow` line is logged while it runs, and its `inserted` line has `"level":"WARN"` (in the JSON; the journal's own priority stays info).
-- Config errors exit with code 78, and the unit does not restart on it: a bad env file, a genesis ID algod doesn't report, or a DB of another network or synced with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`. Fix the cause, then `systemctl restart`. Other failures (algod down, disk) restart every 5 s.
+- Config errors exit with code 78, and the unit does not restart on it: a bad env file, a genesis ID algod doesn't report, or a DB of another network or synced with other `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` or `MSIGS`, or with `REKEYS` and now run without it. Fix the cause, then `systemctl restart`. Other failures (algod down, disk) restart every 5 s.
 - Shutdown waits for the current ingest batch and DuckDB's checkpoint, up to 5 minutes.
 - Set `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` on a host shared with algod. For a hard cap on the whole process as well, add a drop-in: `sudo systemctl edit surf-indexer@mainnet-v1.0`, then `[Service]` and `MemoryMax=3G`, kept above `DUCKDB_MEMORY_LIMIT`.
 - `apt remove` stops running instances; the DBs in `/var/lib/surf-indexer` and the env files stay.
@@ -330,9 +353,9 @@ find <algod datadir> -name ledger.block.sqlite
 LEDGER_DB=<path> CONCURRENCY=<cores> DB_CHUNKS=10000 nice -n 19 ionice -c3 ./surf-indexer mainnet-v1.0
 ```
 
-What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0`.
+What gets imported is set by `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS`, `MSIGS` and `REKEYS`, as for the server (see [Environment Variables](#environment-variables)). The command above uses the defaults: proposers on, and voters for the last 100000 rounds. For a fees-only DB, prefix it with `PROPOSERS=0 VOTER_ROUNDS=0`.
 
-This ingests blocks and upgrades up to the ledger's tip as of startup, closes the DB and exits; no server is started. If interrupted, rerun it to resume. Then, with the server stopped:
+This ingests blocks and upgrades up to the ledger's tip as of startup, fills any [backfill](#backfill) gaps from the ledger too, up to its tip, closes the DB and exits; no server is started. Gaps past the ledger's tip (a DB that is ahead of it) are left for the service to fill from algod, and the last log line says how many rounds are left (`backfillLeft`). If interrupted, rerun it to resume; a rerun doesn't fill the gaps past the ledger's tip either. Then, with the server stopped:
 
 ```
 rsync -P data/mainnet-v1.0.duckdb server:surf-indexer/data/mainnet-v1.0.duckdb.new
@@ -357,6 +380,26 @@ Such a DB is partial: fee sums, series, logic sig `txns` and `firstRound`s, and 
 
 It is safe to run beside a live algod: the DB is opened read-only, and WAL readers don't block algod's writes. It does compete with algod for disk, page cache and CPU, so watch algod's lag (`goal node status`) and throttle with `CONCURRENCY`, or stop algod for the duration.
 
+### Backfill
+
+`REKEYS` can be turned on for a DB that already holds blocks, with no rebuild. On the next start the rounds already stored (from consensus v24 on, where rekeying began: mainnet round 8734690) become a gap that a background job fills, while live ingest goes on from the tip with rekeys included. The feature is in one of three states, read from the DB:
+
+| State | DB | Routes | `/v0/status` |
+| ----- | -- | ------ | ------------ |
+| off | no `rekeys` table | not registered (404) | `"rekeys":false` |
+| backfilling | table present, gaps left | 404 | `"rekeys":false`, plus `"backfill":{"rekeys":{"roundsLeft":n}}` |
+| on | table present, no gaps | served | `"rekeys":true` |
+
+When the last gap closes the routes switch on without a restart, and the log says `backfill done`. Until then an info line `backfill` once a minute gives the next round, rounds left, blocks/s and an ETA. A chunk of up to `DB_CHUNKS` rounds is written whole or not at all, so a restart resumes where it was. A failed chunk logs `backfill` at ERROR and is retried after a minute. If the backfill algods are behind the gap (a lagging archival node), it logs `backfill waiting` once and checks again every minute.
+
+The backfill gets its own algod clients, connections and rate limit, so it neither slows live ingest nor swamps the archival node: `BACKFILL_CONCURRENCY` fetches at once (also the cap on open connections per algod) and at most `BACKFILL_RATE` blocks/s, every retry included (`BACKFILL_RATE=0` removes the limit). By default it uses the `ALGOD_*` algods. Point `BACKFILL_ALGOD_HOST` (with its own `_PORT` and `_TOKEN`: they aren't taken from `ALGOD_*` then) at another archival node to take the load off the one following the tip. The backfill algods must be archival back to the first round it may need (mainnet 8734690, or `START_ROUND` if later): a pruned node fails every chunk. `surf-indexer check` checks that each holds that round when `REKEYS` is on.
+
+Over REST it is a full block per round: ~57.4M on mainnet, about 6.6 days at the default 100/s, under a day at 1,000/s from a nearby archival algod. The fast path is a [bulk load](#bulk-load-from-an-archival-nodes-ledger) import with `REKEYS=1`, which fills the gaps from the ledger file before it exits (hours, limited by disk): stop the service, run the import on the archival node as there, copy the file back, start the service.
+
+An older binary ingests without rekeys and leaves a gap; the next start of this one adds it to the backfill, and the feature reads `false` again until it is filled.
+
+Turning `REKEYS` off for a DB that has it is refused (exit 78), so a missing env line can't drop data that costs a full backfill. To drop it, with the service stopped, as the service user in its working directory: `sudo -u surf-indexer sh -c 'cd /var/lib/surf-indexer && surf-indexer drop-feature rekeys mainnet-v1.0'` (the dbID, as for the server: `data/<dbID>.duckdb`).
+
 ### Environment Variables
 
 | name        | description                                                    | default_value    |
@@ -373,6 +416,12 @@ It is safe to run beside a live algod: the DB is opened read-only, and WAL reade
 | VOTER_ROUNDS | Store cert voters of the last N rounds; 0 for none            | 100000           |
 | LSIGS       | Store logic sig uses, delegators and templates                 | false            |
 | MSIGS       | Store multisig subsigners, whether each signed, and a txn      | false            |
+| REKEYS      | Store rekeys per account and authorizer; can be turned on later ([backfill](#backfill)) | false |
+| BACKFILL_ALGOD_HOST | Archival algod host for [backfill](#backfill) fetches; `;`-separate several for failover. Unset: the `ALGOD_*` algods | |
+| BACKFILL_ALGOD_PORT | Backfill algod port; one value, or one per host | 8080, or the `ALGOD_PORT` value without `BACKFILL_ALGOD_HOST` |
+| BACKFILL_ALGOD_TOKEN | Backfill algod token; one value, or one per host | none, or the `ALGOD_TOKEN` value without `BACKFILL_ALGOD_HOST` |
+| BACKFILL_CONCURRENCY | Concurrent backfill fetches, and the cap on its connections per algod | 4 |
+| BACKFILL_RATE | Most block fetches/s the backfill makes, retries included, burst `BACKFILL_CONCURRENCY`; 0 for no limit | 100 |
 | ADMIN_TOKEN | Enables the [admin](#admin) routes (needs `LSIGS`); 16+ printable ASCII characters, no spaces, e.g. `openssl rand -hex 32` |                  |
 | RATE_LIMIT  | Per-client requests/s across all routes, burst 5×; 0 for no per-client limits ([rate limits](#rate-limits)) | 10 |
 | HEAVY_CONCURRENCY | Heavy requests running at once, across all clients; 0 for no cap | 4 |
@@ -382,11 +431,11 @@ It is safe to run beside a live algod: the DB is opened read-only, and WAL reade
 | DB_ID       | systemd unit only: serve `data/<DB_ID>.duckdb` (the dbID argument) | the genesis ID |
 | START_ROUND | Trials only: an empty DB starts at this round ([bulk load](#bulk-load-from-an-archival-nodes-ledger)) | 0 |
 
-`PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.
+`PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. `REKEYS` can be turned on later ([backfill](#backfill)), but not off. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.
 
 ### Disk and DB size
 
-Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB. Logic sigs take an estimated ~80 B per (program, signer, sender) plus one program per template, growing with distinct programs rather than rounds. Multisig subsigners take an estimated ~80 B per (subsigner, multisig), growing with distinct multisigs rather than rounds. With `LSIGS` or `MSIGS` on every round is a full block fetch (shared when both are on): free at the tip while `VOTER_ROUNDS` is above 0, else ~70 KB per block (~2 GB/day) over REST, and a ledger import reads whole blocks after the incentives upgrade too.
+Disk and bandwidth, mainnet at 65.7M rounds: blocks take ~265 MiB fees-only, ~412 MiB with proposers. Voters take ~27 MiB per 100k rounds, and each round in the window is a full block fetch with cert (~70 KB), so filling a 100k window over REST downloads ~7 GB. Logic sigs take an estimated ~80 B per (program, signer, sender) plus one program per template, growing with distinct programs rather than rounds. Multisig subsigners take an estimated ~80 B per (subsigner, multisig), growing with distinct multisigs rather than rounds. Rekeys take an estimated ~80 B per (account, authorizer), growing with distinct pairs; the mainnet figure is to be measured. With `LSIGS`, `MSIGS` or `REKEYS` on every round is a full block fetch (shared when both are on): free at the tip while `VOTER_ROUNDS` is above 0, else ~70 KB per block (~2 GB/day) over REST, and a ledger import reads whole blocks after the incentives upgrade too.
 
 Estimated mainnet DB size: ~0.45 GB with the defaults (proposers on, 100k-round voter window), and ~0.5–0.9 GB with `LSIGS`. Blocks grow by ~11 B per round at today's format, ~100 MiB a year; the voter window stays flat. The logic sig share is a guess (0.5–5M rows at ~80 B): a trial over rounds 58.0M–65.8M stored only 4,645 rows (~1 MiB), but most lsig use is older (Tinyman v1, NFT-listing escrows), so only a full `LSIGS` import gives the real figure. The file is about the size of its data: the trial's 121.5 MiB file is nearly all used blocks.
 

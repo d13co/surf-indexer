@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -128,9 +132,10 @@ func TestReadEnvFile(t *testing.T) {
 // loadConfig reports every bad setting at once.
 func TestLoadConfigErrors(t *testing.T) {
 	clearEnv(t)
-	setEnv(t, map[string]string{"PORT": "70000", "LSIGS": "maybe", "VOTER_ROUNDS": "-1", "ADMIN_TOKEN": "short", "DUCKDB_MEMORY_LIMIT": "lots"})
+	setEnv(t, map[string]string{"PORT": "70000", "LSIGS": "maybe", "VOTER_ROUNDS": "-1", "ADMIN_TOKEN": "short", "DUCKDB_MEMORY_LIMIT": "lots",
+		"REKEYS": "maybe", "BACKFILL_CONCURRENCY": "0", "BACKFILL_RATE": "-1"})
 	_, err := loadConfig()
-	for _, s := range []string{"PORT", "LSIGS", "VOTER_ROUNDS", "ADMIN_TOKEN", "DUCKDB_MEMORY_LIMIT"} {
+	for _, s := range []string{"PORT", "LSIGS", "VOTER_ROUNDS", "ADMIN_TOKEN", "DUCKDB_MEMORY_LIMIT", "REKEYS", "BACKFILL_CONCURRENCY", "BACKFILL_RATE"} {
 		if err == nil || !strings.Contains(err.Error(), s) {
 			t.Errorf("want %s in %v", s, err)
 		}
@@ -138,8 +143,60 @@ func TestLoadConfigErrors(t *testing.T) {
 
 	clearEnv(t)
 	setEnv(t, map[string]string{"LISTEN_ADDR": "[::1]", "PORT": "9"})
-	if s, err := loadConfig(); err != nil || s.listen != "[::1]:9" || len(s.dbOptions) != 0 {
-		t.Errorf("got %q %v, %v", s.listen, s.dbOptions, err)
+	if s, err := loadConfig(); err != nil || s.listen != "[::1]:9" || len(s.dbOptions) != 0 || s.backfill != (backfillConfig{concurrency: 4, rate: 100}) {
+		t.Errorf("got %q %v %+v, %v", s.listen, s.dbOptions, s.backfill, err)
+	}
+}
+
+// Backfill algods on other hosts don't get the ALGOD_* token (or port).
+func TestBackfillAlgodToken(t *testing.T) {
+	var got atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.Store(r.Header.Get("X-Algo-API-Token"))
+		http.Error(w, "no", http.StatusTeapot)
+	}))
+	defer srv.Close()
+	host, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	for _, c := range []struct {
+		env  map[string]string
+		want string
+	}{
+		{map[string]string{"ALGOD_HOST": "http://" + host, "ALGOD_PORT": port, "ALGOD_TOKEN": "tip"}, "tip"}, // the ALGOD_* algods
+		{map[string]string{"ALGOD_TOKEN": "tip", "BACKFILL_ALGOD_HOST": "http://" + host, "BACKFILL_ALGOD_PORT": port}, ""},
+		{map[string]string{"ALGOD_TOKEN": "tip", "BACKFILL_ALGOD_HOST": "http://" + host, "BACKFILL_ALGOD_PORT": port, "BACKFILL_ALGOD_TOKEN": "bf"}, "bf"},
+	} {
+		clearEnv(t)
+		setEnv(t, c.env)
+		a, err := algodClients(true, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got.Store("none")
+		a[0].Status().Do(context.Background())
+		if g := got.Load(); g != c.want {
+			t.Errorf("%v: token %q, want %q", c.env, g, c.want)
+		}
+	}
+}
+
+// Backfill algods take each ALGOD_* value they don't set, and keep their own transport.
+func TestBackfillAlgods(t *testing.T) {
+	clearEnv(t)
+	setEnv(t, map[string]string{"ALGOD_HOST": "http://a;http://b", "ALGOD_PORT": "1", "ALGOD_TOKEN": "t", "BACKFILL_ALGOD_PORT": "2"})
+	live, err := algodClients(false, 3)
+	if err != nil || len(live) != 2 {
+		t.Fatal(live, err)
+	}
+	bf, err := algodClients(true, 3)
+	if err != nil || len(bf) != 2 {
+		t.Fatal(bf, err)
+	}
+	setEnv(t, map[string]string{"BACKFILL_ALGOD_HOST": "http://c;http://d;http://e", "BACKFILL_ALGOD_PORT": "2;3"})
+	if _, err := algodClients(true, 3); err == nil || !strings.Contains(err.Error(), "BACKFILL_ALGOD_HOST") {
+		t.Errorf("3 hosts, 2 ports = %v, want a BACKFILL_ALGOD_* error", err)
+	}
+	if _, err := algodClients(false, 3); err != nil {
+		t.Errorf("live algods with 3 backfill hosts: %v", err)
 	}
 }
 

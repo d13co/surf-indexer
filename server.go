@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -201,13 +202,27 @@ func routes(db *sql.DB) http.Handler {
 	light("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
 		// From memory, not a query: every algo.surf page asks for it.
 		s := stored.Load()
-		// The config says which feature routes exist: those off are 404s.
+		// The config says which feature routes exist: those off are 404s. A backfillable feature
+		// reads false until backfilled, and while it backfills says how far it has to go.
+		c := track
+		c.Rekeys = ready("rekeys")
+		type progress struct {
+			RoundsLeft uint64 `json:"roundsLeft"`
+		}
+		var backfill map[string]progress
+		for f, n := range roundsLeft() {
+			if backfill == nil {
+				backfill = map[string]progress{}
+			}
+			backfill[f] = progress{n}
+		}
 		reply(w, r, struct {
 			OK       int   `json:"ok"`
 			MaxRound int64 `json:"maxRound"`
 			Records  int64 `json:"records"`
 			config
-		}{1, s.hi, s.n, track}, nil)
+			Backfill map[string]progress `json:"backfill,omitempty"`
+		}{1, s.hi, s.n, c, backfill}, nil)
 	})
 
 	light("GET /v0/block", func(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +527,20 @@ func routes(db *sql.DB) http.Handler {
 			ORDER BY rnd DESC, pos DESC, signer))::VARCHAR, '[]')
 			FROM (SELECT * FROM msig_signers WHERE msig = $2 ORDER BY rnd DESC, pos DESC, signer LIMIT $1)`)
 	}
+	if track.Rekeys {
+		// Served once backfilled: partial history (a first round that is only the earliest backfilled)
+		// would mislead. Until then it is a 404, as with the feature off.
+		whenReady := func(pattern string, h http.HandlerFunc) {
+			light(pattern, func(w http.ResponseWriter, r *http.Request) {
+				if !ready("rekeys") {
+					http.NotFound(w, r)
+					return
+				}
+				h(w, r)
+			})
+		}
+		limited(whenReady, "GET /v0/rekeys/{addr}", rekeysSQL)
+	}
 	if track.Proposers || track.VoterRounds > 0 {
 		light("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
 			if a, ok := addr(w, r); ok {
@@ -521,11 +550,11 @@ func routes(db *sql.DB) http.Handler {
 		})
 	}
 	// What algo.surf's account page needs to pick its tabs before fetching any list: a scan of each
-	// tracked table (~40–50 ms on mainnet), against one request per list. Keys of untracked features are
-	// left out; an address never seen gets zeros.
-	if track.Lsigs || track.Msigs || track.Proposers || track.VoterRounds > 0 {
-		var keys []string
-		from := ""
+	// tracked table (~40–50 ms on mainnet) but rekeys, two index lookups, against one request per
+	// list. Keys of untracked features, and of backfillable ones not yet backfilled, are left out; an
+	// address never seen gets zeros.
+	if track.Lsigs || track.Msigs || track.Proposers || track.VoterRounds > 0 || track.Rekeys {
+		var keys, from []string
 		if track.Lsigs {
 			keys = append(keys, `'lsig': (SELECT {'template': tmpl, 'name': `+name+`l.tmpl)}
 				FROM (SELECT tmpl FROM lsigs WHERE prog = $1 ORDER BY last_rnd DESC LIMIT 1) l)`,
@@ -533,8 +562,8 @@ func routes(db *sql.DB) http.Handler {
 		}
 		if track.Msigs { // both counts in one scan
 			keys = append(keys, `'multisigs': m.multisigs`, `'signers': m.signers`)
-			from = ` FROM (SELECT count(*) FILTER (WHERE signer = $1) AS multisigs, count(*) FILTER (WHERE msig = $1) AS signers
-				FROM msig_signers WHERE signer = $1 OR msig = $1) m`
+			from = append(from, `(SELECT count(*) FILTER (WHERE signer = $1) AS multisigs, count(*) FILTER (WHERE msig = $1) AS signers
+				FROM msig_signers WHERE signer = $1 OR msig = $1) m`)
 		}
 		if track.Proposers {
 			keys = append(keys, `'proposed': EXISTS (SELECT 1 FROM blocks WHERE prop = $1)`,
@@ -543,8 +572,30 @@ func routes(db *sql.DB) http.Handler {
 		if track.VoterRounds > 0 {
 			keys = append(keys, `'voted': EXISTS (SELECT 1 FROM voters WHERE voter = $1)`)
 		}
-		q := `SELECT to_json({` + strings.Join(keys, ", ") + `})::VARCHAR` + from
+		// build makes the query from keys and from, "" if there are no keys.
+		build := func(keys, from []string) string {
+			if len(keys) == 0 {
+				return ""
+			}
+			q := `SELECT to_json({` + strings.Join(keys, ", ") + `})::VARCHAR`
+			if len(from) > 0 {
+				q += " FROM " + strings.Join(from, ", ")
+			}
+			return q
+		}
+		q, qRekeys := build(keys, from), ""
+		if track.Rekeys {
+			qRekeys = build(append(slices.Clip(keys), rekeyCounts...), from)
+		}
 		light("GET /v0/account/{addr}", func(w http.ResponseWriter, r *http.Request) {
+			q := q
+			if qRekeys != "" && ready("rekeys") {
+				q = qRekeys
+			}
+			if q == "" { // only rekeys tracked, and not yet backfilled
+				http.NotFound(w, r)
+				return
+			}
 			if a, ok := addr(w, r); ok {
 				replySQL(w, r, db, q, a)
 			}
@@ -572,6 +623,29 @@ func routes(db *sql.DB) http.Handler {
 			"ms", float64(time.Since(t).Microseconds())/1000, "remote", r.RemoteAddr, "client", key)
 	})
 }
+
+// rekeysSQL is /v0/rekeys's query: an account's newest $1 authorizers (to, its own self row
+// included) and the newest $1 accounts rekeyed to it (from). Each side is one equality on an indexed
+// column, materialized before any other filter: an OR, or an AND pushed into the scan, would turn
+// the index lookup back into a scan of rekeys (rekeysIndexes).
+var rekeysSQL = func() string {
+	// rows lists the newest $1 of cte's rows matching where (if any), the other side of the pair as address.
+	rows := func(cte, other, where string) string {
+		newest := " ORDER BY last_rnd DESC, " + other
+		if where != "" {
+			where = " WHERE " + where
+		}
+		return `coalesce((SELECT list({'address': ` + other + `, 'txns': txns, 'firstRound': first_rnd, 'lastRound': last_rnd}` + newest + `)
+			FROM (SELECT * FROM ` + cte + where + newest + ` LIMIT $1)), [])`
+	}
+	return `WITH t AS MATERIALIZED (SELECT * FROM rekeys WHERE acct = $2), f AS MATERIALIZED (SELECT * FROM rekeys WHERE auth = $2)
+		SELECT to_json({'to': ` + rows("t", "auth", "") + `, 'from': ` + rows("f", "acct", "acct <> $2") + `})::VARCHAR`
+}()
+
+// rekeyCounts are /v0/account's rekeys keys, the lengths of /v0/rekeys's lists (to includes the
+// self row). One equality on an indexed column each, as in rekeysSQL.
+var rekeyCounts = []string{`'rekeysTo': (SELECT count(*) FROM rekeys WHERE acct = $1)`,
+	`'rekeysFrom': (SELECT count(*) FILTER (WHERE acct <> $1) FROM rekeys WHERE auth = $1)`}
 
 // cacheFor is the Cache-Control a GET's (or HEAD's) 200 gets, so browsers and a caching proxy can
 // answer repeats. The tip moves every ~3 s: status is kept for 2 s, the rest for 10 s.
