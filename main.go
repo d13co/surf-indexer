@@ -115,7 +115,7 @@ func openData(ctx context.Context, dbID, genesisID string) *sql.DB {
 }
 
 // importLedger bulk-loads from an archival ledger.block.sqlite up to its current tip, fills any
-// backfill gaps from it too, then returns.
+// backfill gaps from it too, up to its tip, then returns.
 func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency, chunk int) {
 	src, ldb, err := ledgerSource(path, genesisID, concurrency)
 	if err != nil {
@@ -130,10 +130,15 @@ func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency
 	if err != nil {
 		fatal("ledger import", "err", err)
 	}
-	slog.Info("ledger import done, db closed")
+	if l := roundsLeft(); l != nil { // past the ledger's tip: the service fills them from algod
+		slog.Info("ledger import done, db closed", "backfillLeft", l)
+	} else {
+		slog.Info("ledger import done, db closed")
+	}
 }
 
-// runImport ingests src up to its tip, syncs upgrades and drains every backfill gap from src.
+// runImport ingests src up to its tip, syncs upgrades and drains the backfill gaps from src, up to its
+// tip; those past it are left for the service.
 func runImport(ctx context.Context, db *sql.DB, src source, concurrency, chunk int) error {
 	hi, err := syncToTip(ctx, db, src, concurrency, uint64(chunk))
 	if err == nil {
@@ -148,7 +153,7 @@ func runImport(ctx context.Context, db *sql.DB, src source, concurrency, chunk i
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil))) // also routes any log package output
 	if len(os.Args) < 2 {
-		fatal("usage: surf-indexer <genesisID> [dbID] | check [-env-file FILE] [-offline] <genesisID> | drop-feature <feature> <db file> | version")
+		fatal("usage: surf-indexer <genesisID> [dbID] | check [-env-file FILE] [-offline] <genesisID> | drop-feature <feature> <dbID> | version")
 	}
 	switch os.Args[1] {
 	case "version":

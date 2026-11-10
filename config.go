@@ -241,11 +241,13 @@ func check(args []string) int {
 		return code
 	}
 	// The backfill needs rounds from the first a tracked feature can hold (genesis has no txns, so
-	// round 1 at the earliest), so its algods must be archival back to there: a pruned node would fail
-	// every chunk, forever.
+	// round 1 at the earliest), and none below START_ROUND, where the DB starts. So its algods must be
+	// archival back to there: a pruned node would fail every chunk, forever. check doesn't open the DB
+	// (the service holds its lock), so it can't tell a DB with no gaps left, which needs no round at
+	// all; and it is exact only with the service's START_ROUND (a lower one asks for an earlier round).
 	first := uint64(math.MaxUint64)
 	for _, j := range jobs {
-		first = min(first, max(j.from(genesisID), 1))
+		first = min(first, max(j.from(genesisID), s.startRound, 1))
 	}
 	b := a // the ALGOD_* algods, already checked above
 	if backfillAlgodSet() {

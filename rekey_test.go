@@ -393,6 +393,23 @@ func TestRekeySetup(t *testing.T) {
 		t.Errorf("empty trial: gaps %q", got)
 	}
 	db.Close()
+	// A DB with blocks takes next from its tip, not a stale START_ROUND past it: openData refuses
+	// such a start only after setup has committed.
+	startRound = 0
+	path = filepath.Join(dir, "stale.duckdb")
+	if db, err = openWith(t, path, config{}); err != nil {
+		t.Fatal(err)
+	}
+	insertRounds(t, db, 0, 20)
+	db.Close()
+	startRound = 30
+	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gaps(t, db); !slices.Equal(got, []string{"next 21", "1-20"}) {
+		t.Errorf("stale START_ROUND: gaps %q", got)
+	}
+	db.Close()
 	startRound = 0
 
 	// Rekeys doesn't count in the fixed config: other changes are still refused.
@@ -703,6 +720,27 @@ func TestImportDrainsBackfill(t *testing.T) {
 	}
 }
 
+// A LEDGER_DB import from a ledger behind the DB fills the gaps up to the ledger's tip and leaves the
+// rest to the service, without failing, on a rerun too.
+func TestImportBehindLedger(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	chain := rekeyChain(30)
+	db := turnOn(t, filepath.Join(t.TempDir(), "x.duckdb"), chain, 20)
+	want := freshRekeys(t, chain[:16]) // rounds 0-15
+	m := &memSource{blocks: chain, tip: 15}
+	for run := range 2 {
+		if err := runImport(context.Background(), db, m.source(), 2, 6); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if got := gaps(t, db); !slices.Equal(got, []string{"next 21", "16-20"}) || ready("rekeys") || roundsLeft()["rekeys"] != 5 {
+			t.Errorf("run %d: gaps after the import = %q, ready %t, roundsLeft %v", run, got, ready("rekeys"), roundsLeft())
+		}
+		if got := rekeyRows(t, db); !slices.Equal(got, want) {
+			t.Errorf("run %d: rekeys after the import = %q, want rounds 1-15's %q", run, got, want)
+		}
+	}
+}
+
 // BACKFILL_RATE caps fetch attempts per second, retries included, and BACKFILL_CONCURRENCY those in
 // flight, as an algod sees them.
 func TestBackfillLimits(t *testing.T) {
@@ -873,14 +911,18 @@ func TestCheckBackfillArchival(t *testing.T) {
 	clearEnv(t)
 	setEnv(t, map[string]string{"ALGOD_HOST": srv.URL[:strings.LastIndex(srv.URL, ":")], "ALGOD_PORT": srv.URL[strings.LastIndex(srv.URL, ":")+1:]})
 	for _, c := range []struct {
-		rekeys string
-		from   uint64
-		want   int
-	}{{"", 0, 0}, {"1", 5, 0}, {"1", 3, 1}, {"1", 0, 1}} { // 0: unknown, so round 1
+		rekeys      string
+		from, start uint64
+		want        int
+	}{
+		{"", 0, 0, 0}, {"1", 5, 0, 0}, {"1", 3, 0, 1}, {"1", 0, 0, 1}, // from 0: unknown, so round 1
+		{"1", 3, 5, 0}, {"1", 0, 5, 0}, // the DB starts at START_ROUND: no round below it is needed
+	} {
 		t.Setenv("REKEYS", c.rekeys)
+		t.Setenv("START_ROUND", fmt.Sprint(c.start))
 		rekeyFrom = map[string]uint64{"test-v1": c.from}
 		if got := check([]string{"test-v1"}); got != c.want {
-			t.Errorf("REKEYS=%q from round %d: check = %d, want %d", c.rekeys, c.from, got, c.want)
+			t.Errorf("REKEYS=%q from round %d START_ROUND=%d: check = %d, want %d", c.rekeys, c.from, c.start, got, c.want)
 		}
 	}
 }
