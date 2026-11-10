@@ -62,6 +62,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # apt-ftparchive, for apt-publish.sh: ubuntu-latest no longer has it from 26.04 on.
+      - run: sudo apt-get update && sudo apt-get install -y apt-utils
       - name: Download the .debs
         env:
           GH_TOKEN: ${{ github.token }}
