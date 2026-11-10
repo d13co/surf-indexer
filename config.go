@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -236,8 +235,7 @@ func check(args []string) int {
 		}
 	}
 	checkAlgods("algod", a)
-	jobs := slices.Collect(trackedJobsOf(s.track))
-	if len(jobs) == 0 {
+	if !anyTracked(s.track) {
 		return code
 	}
 	// The backfill needs rounds from the first a tracked feature can hold (genesis has no txns, so
@@ -245,9 +243,12 @@ func check(args []string) int {
 	// archival back to there: a pruned node would fail every chunk, forever. check doesn't open the DB
 	// (the service holds its lock), so it can't tell a DB with no gaps left, which needs no round at
 	// all; and it is exact only with the service's START_ROUND (a lower one asks for an earlier round).
-	first := uint64(math.MaxUint64)
-	for _, j := range jobs {
+	// It fetches what the backfill does: a full block if any tracked feature needs the payset, as a
+	// node may serve a header it can't serve the whole block of.
+	first, full := uint64(math.MaxUint64), false
+	for j := range trackedJobsOf(s.track) {
 		first = min(first, max(j.from(genesisID), s.startRound, 1))
+		full = full || j.full
 	}
 	b := a // the ALGOD_* algods, already checked above
 	if backfillAlgodSet() {
@@ -259,7 +260,7 @@ func check(args []string) int {
 	for i, c := range b { // each on its own, so a pruned failover algod shows too
 		name := fmt.Sprintf("backfill algod %d", i)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_, err := algodSource(algods{c}, genesisID, nil).get(ctx, first, true, false) // checks the genesis ID too
+		_, err := algodSource(algods{c}, genesisID, nil).get(ctx, first, !full, false) // checks the genesis ID too
 		cancel()
 		if err != nil {
 			code = max(code, fail(1, name, fmt.Errorf("round %d, the first the backfill may need: %w (is it archival?)", first, err)))

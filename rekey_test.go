@@ -308,6 +308,25 @@ func TestRekeySetup(t *testing.T) {
 			t.Errorf("drop-feature of dbID %q = %d, want 2", id, code)
 		}
 	}
+	// Another DuckDB file in data/ is refused and left as it is.
+	other := filepath.Join(dir, "other.duckdb")
+	if raw, err = sql.Open("duckdb", other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("CREATE TABLE rekeys(x INT)"); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	if code := dropFeature([]string{"rekeys", "other"}); code != 1 {
+		t.Errorf("drop-feature of a DB that isn't surf-indexer's = %d, want 1", code)
+	}
+	if raw, err = sql.Open("duckdb", other); err != nil {
+		t.Fatal(err)
+	}
+	if got := strs(t, raw, "SELECT table_name FROM duckdb_tables() ORDER BY 1"); !slices.Equal(got, []string{"rekeys"}) {
+		t.Errorf("tables after a refused drop-feature = %q", got)
+	}
+	raw.Close()
 
 	// The gap starts no earlier than the network's first rekey round.
 	defer func(m map[string]uint64) { rekeyFrom = m }(rekeyFrom)
@@ -386,6 +405,28 @@ func TestRekeySetup(t *testing.T) {
 	}
 	db.Close()
 
+	// So is one with a gap: the gap is deleted and the same one added again, in one transaction.
+	path = filepath.Join(dir, "lostgap.duckdb")
+	if db, err = openWith(t, path, config{}); err != nil {
+		t.Fatal(err)
+	}
+	insertRounds(t, db, 0, 9)
+	db.Close()
+	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DELETE FROM feature_sync"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gaps(t, db); !slices.Equal(got, []string{"next 10", "1-9"}) {
+		t.Errorf("lost next with a gap: gaps %q", got)
+	}
+	db.Close()
+
 	// An empty DB gets no gap and is ready at once; with no blocks, it may be turned off again.
 	path = filepath.Join(dir, "empty.duckdb")
 	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
@@ -438,6 +479,27 @@ func TestRekeySetup(t *testing.T) {
 	}
 	db.Close()
 	startRound = 0
+	// An empty DB turned on (next 0) that an older binary then filled from START_ROUND 5: the gap
+	// starts at the DB's first round, not below it.
+	path = filepath.Join(dir, "later.duckdb")
+	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if raw, err = sql.Open("duckdb", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("INSERT INTO blocks (rnd, ts, tc, fees, txns) SELECT r, r, 0, 0, 0 FROM range(5, 10) t(r)"); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gaps(t, db); !slices.Equal(got, []string{"next 10", "5-9"}) {
+		t.Errorf("DB from round 5: gaps %q", got)
+	}
+	db.Close()
 
 	// Rekeys doesn't count in the fixed config: other changes are still refused.
 	if db, err = openWith(t, filepath.Join(dir, "fixed.duckdb"), config{Proposers: true}); err != nil {
@@ -978,7 +1040,7 @@ func TestCheckBackfillArchival(t *testing.T) {
 		}
 		var rnd int
 		fmt.Sscanf(r.URL.Path, "/v2/blocks/%d", &rnd)
-		if rnd < 5 { // pruned
+		if rnd < 5 && r.URL.Query().Get("header-only") != "true" { // pruned, but serves headers: check must fetch what the backfill does
 			http.Error(w, `{"message":"ledger does not have entry"}`, http.StatusNotFound)
 			return
 		}

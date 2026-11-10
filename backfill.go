@@ -40,7 +40,7 @@ type job struct {
 
 // backfillTables are shared by every backfillable feature. Older binaries don't read them.
 const backfillTables = `CREATE TABLE IF NOT EXISTS feature_sync(feature VARCHAR PRIMARY KEY, next UINTEGER NOT NULL); -- ingest writes the feature from round next on
-CREATE TABLE IF NOT EXISTS backfill_gaps(feature VARCHAR NOT NULL, lo UINTEGER NOT NULL, hi UINTEGER NOT NULL)  -- stored rounds whose rows are missing`
+CREATE TABLE IF NOT EXISTS backfill_gaps(feature VARCHAR NOT NULL, lo UINTEGER NOT NULL, hi UINTEGER NOT NULL, PRIMARY KEY (feature, lo))  -- stored rounds whose rows are missing; step cuts a gap by its lo`
 
 var rekeysJob = job{
 	feature: "rekeys",
@@ -69,6 +69,14 @@ func trackedJobsOf(c config) iter.Seq[job] {
 	}
 }
 
+// anyTracked reports whether c has any backfillable feature on.
+func anyTracked(c config) bool {
+	for range trackedJobsOf(c) {
+		return true
+	}
+	return false
+}
+
 // trackedJobs yields the backfillable features track has on. It reads track on each call, so tests
 // that set track see the change.
 func trackedJobs() iter.Seq[job] { return trackedJobsOf(track) }
@@ -87,11 +95,12 @@ func setupJob(tx *sql.Tx, j job, path, genesisID string, lo, hi int64) error {
 		}
 		return dropJob(tx, j)
 	}
-	// addGap records [max(from, j.from, 1), hi] as missing (genesis has no txns), and ingest as
-	// writing from the next round it stores: hi+1, or START_ROUND for an empty DB. Not START_ROUND
-	// for a DB with blocks: openData refuses a stale one only after this commits.
+	// addGap records [max(from, lo, j.from, 1), hi] as missing (no round below the DB's first, and
+	// genesis has no txns), and ingest as writing from the next round it stores: hi+1, or START_ROUND
+	// for an empty DB. Not START_ROUND for a DB with blocks: openData refuses a stale one only after
+	// this commits.
 	addGap := func(from int64) error {
-		from = max(from, int64(j.from(genesisID)), 1)
+		from = max(from, lo, int64(j.from(genesisID)), 1)
 		if from <= hi {
 			if _, err := tx.Exec("INSERT INTO backfill_gaps VALUES (?, ?, ?)", j.feature, from, hi); err != nil {
 				return err
@@ -213,26 +222,45 @@ func dropFeature(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer db.Close()
-	tx, err := db.Begin()
-	if err == nil {
-		defer tx.Rollback()
-		if _, err = tx.Exec(backfillTables); err == nil {
-			err = dropJob(tx, *j)
+	genesisID, err := dropIn(db, *j)
+	if cerr := db.Close(); err == nil { // checkpoints
+		err = cerr
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+		return 1
+	}
+	fmt.Printf("dropped %s from %s (%s)\n", j.feature, path, genesisID)
+	return 0
+}
+
+// dropIn drops j from db, a surf-indexer DB: one with its genesis ID in meta, which it returns. Any
+// other DuckDB file is left as it is.
+func dropIn(db *sql.DB, j job) (genesisID string, err error) {
+	var ours bool
+	if err = db.QueryRow("SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'meta'").Scan(&ours); err == nil && ours {
+		if err = db.QueryRow("SELECT genesis FROM meta").Scan(&genesisID); errors.Is(err, sql.ErrNoRows) {
+			err = nil
 		}
+	}
+	if err == nil && genesisID == "" {
+		err = errors.New("not a surf-indexer DB (no genesis ID in meta)")
+	}
+	if err != nil {
+		return "", err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(backfillTables); err == nil {
+		err = dropJob(tx, j)
 	}
 	if err == nil {
 		err = tx.Commit()
 	}
-	if err == nil {
-		err = db.Close() // checkpoints
-	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Printf("dropped %s from %s\n", j.feature, path)
-	return 0
+	return genesisID, err
 }
 
 // left is each tracked backfillable feature's rounds left to backfill, for /v0/status and to gate its
