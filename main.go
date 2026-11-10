@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -197,7 +198,7 @@ func main() {
 
 	// Backfill jobs get their own algods, connections and rate limit.
 	bf := backfiller{concurrency: s.backfill.concurrency, chunk: uint64(chunk)}
-	if len(trackedJobs()) > 0 {
+	if len(slices.Collect(trackedJobs())) > 0 {
 		b, err := algodClients(true, s.backfill.concurrency)
 		if err != nil {
 			fatalConfig("backfill algod config", "err", err)

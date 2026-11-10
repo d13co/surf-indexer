@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -235,7 +236,7 @@ func check(args []string) int {
 		}
 	}
 	checkAlgods("algod", a)
-	jobs := trackedJobsOf(s.track)
+	jobs := slices.Collect(trackedJobsOf(s.track))
 	if len(jobs) == 0 {
 		return code
 	}

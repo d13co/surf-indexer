@@ -286,7 +286,7 @@ func insertLocked(ctx context.Context, db *sql.DB, rows []block) error {
 		err = mergeMsigs(ctx, tx, rows)
 	}
 	last := rows[len(rows)-1].Rnd
-	for _, j := range trackedJobs() { // next moves with the rows, so the two never disagree
+	for j := range trackedJobs() { // next moves with the rows, so the two never disagree
 		if err == nil {
 			err = j.merge(ctx, tx, rows)
 		}

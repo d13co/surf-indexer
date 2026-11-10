@@ -184,7 +184,7 @@ func fetchBlock(ctx context.Context, src source, rnd uint64, voters bool) (block
 	if track.Msigs {
 		blk.msigs = msigUses(b.Block)
 	}
-	for _, j := range trackedJobs() {
+	for j := range trackedJobs() {
 		j.extract(b, &blk)
 	}
 	return blk, nil

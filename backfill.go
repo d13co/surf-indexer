@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"math"
 	"os"
@@ -26,6 +27,8 @@ import (
 //   - on: table present, no gaps
 type job struct {
 	feature string
+	env     string                                                    // the variable that turns it on
+	on      func(c config) bool                                       // whether c has it on
 	table   string                                                    // its DDL, run when it is turned on; the table is named feature
 	drop    string                                                    // drops its tables
 	from    func(genesisID string) uint64                             // the first round that can hold its rows
@@ -40,6 +43,8 @@ CREATE TABLE IF NOT EXISTS backfill_gaps(feature VARCHAR NOT NULL, lo UINTEGER N
 
 var rekeysJob = job{
 	feature: "rekeys",
+	env:     "REKEYS",
+	on:      func(c config) bool { return c.Rekeys },
 	table:   rekeysTable,
 	drop:    "DROP TABLE IF EXISTS rekeys",
 	from:    func(genesisID string) uint64 { return rekeyFrom[genesisID] },
@@ -51,27 +56,20 @@ var rekeysJob = job{
 // allJobs is every backfillable feature, tracked or not.
 var allJobs = []job{rekeysJob}
 
-// tracks reports whether c has feature on.
-func (c config) tracks(feature string) bool {
-	switch feature {
-	case "rekeys":
-		return c.Rekeys
-	}
-	return false
-}
-
-// trackedJobsOf are the backfillable features c has on.
-func trackedJobsOf(c config) (out []job) {
-	for _, j := range allJobs {
-		if c.tracks(j.feature) {
-			out = append(out, j)
+// trackedJobsOf yields the backfillable features c has on.
+func trackedJobsOf(c config) iter.Seq[job] {
+	return func(yield func(job) bool) {
+		for _, j := range allJobs {
+			if j.on(c) && !yield(j) {
+				return
+			}
 		}
 	}
-	return out
 }
 
-// trackedJobs are the backfillable features track has on.
-func trackedJobs() []job { return trackedJobsOf(track) }
+// trackedJobs yields the backfillable features track has on. It reads track on each call, so tests
+// that set track see the change.
+func trackedJobs() iter.Seq[job] { return trackedJobsOf(track) }
 
 // setupJob brings j's tables in line with track, in setup's transaction. hi is the last stored round
 // (-1 when empty), lo the first.
@@ -80,11 +78,10 @@ func setupJob(tx *sql.Tx, j job, path, genesisID string, lo, hi int64) error {
 	if err := tx.QueryRow("SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = ?", j.feature).Scan(&have); err != nil {
 		return err
 	}
-	on := track.tracks(j.feature)
-	if !on {
+	if !j.on(track) {
 		if have && hi >= 0 { // its data costs a full backfill: a missing env line must not drop it
 			return configErr{fmt.Errorf("%s was synced with %s=true: run with it, or drop it with surf-indexer drop-feature %s %s (service stopped)",
-				path, envOf(j.feature), j.feature, strings.TrimSuffix(filepath.Base(path), ".duckdb"))}
+				path, j.env, j.feature, strings.TrimSuffix(filepath.Base(path), ".duckdb"))}
 		}
 		return dropJob(tx, j)
 	}
@@ -145,15 +142,6 @@ func dropJob(tx *sql.Tx, j job) error {
 		}
 	}
 	return err
-}
-
-// envOf is the variable that turns feature on.
-func envOf(feature string) string {
-	switch feature {
-	case "rekeys":
-		return "REKEYS"
-	}
-	return feature
 }
 
 // dropFeature is the drop-feature subcommand: it drops a backfillable feature's data from
@@ -217,15 +205,23 @@ var left atomic.Pointer[map[string]uint64]
 // loadLeft reads every tracked feature's rounds left from the DB.
 func loadLeft(ctx context.Context, db *sql.DB) error {
 	m := map[string]uint64{}
-	for _, j := range trackedJobs() {
-		var n uint64
-		if err := db.QueryRowContext(ctx, "SELECT coalesce(sum(hi - lo + 1), 0)::UBIGINT FROM backfill_gaps WHERE feature = ?", j.feature).Scan(&n); err != nil {
+	for j := range trackedJobs() {
+		n, err := gapRounds(ctx, db, j.feature)
+		if err != nil {
 			return err
 		}
 		m[j.feature] = n
 	}
 	left.Store(&m)
 	return nil
+}
+
+// gapRounds is feature's rounds left to backfill, read through q (a DB or a transaction).
+func gapRounds(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, feature string) (n uint64, err error) {
+	err = q.QueryRowContext(ctx, "SELECT coalesce(sum(hi - lo + 1), 0)::UBIGINT FROM backfill_gaps WHERE feature = ?", feature).Scan(&n)
+	return n, err
 }
 
 var leftMu sync.Mutex // serializes setLeft's copy-on-write
@@ -305,7 +301,7 @@ func (e errBehind) Error() string {
 // returns. A failed step is logged and retried after backfillRetry; a source behind the gap is
 // logged once (not as an error) and checked again as often. Live ingest never waits on it.
 func runBackfill(ctx context.Context, db *sql.DB, bf backfiller) {
-	for _, j := range trackedJobs() {
+	for j := range trackedJobs() {
 		start, last := time.Now(), time.Now()
 		var done, since uint64 // rounds cut, in all and since the last progress log
 		behind := false
@@ -350,7 +346,7 @@ func runBackfill(ctx context.Context, db *sql.DB, bf backfiller) {
 // drainBackfill fills every tracked feature's gaps and returns, stopping at the first error. A
 // LEDGER_DB import runs it, from the ledger file: the fast path for a large backfill.
 func drainBackfill(ctx context.Context, db *sql.DB, bf backfiller) error {
-	for _, j := range trackedJobs() {
+	for j := range trackedJobs() {
 		start := time.Now()
 		var done uint64
 		for {
@@ -435,7 +431,7 @@ func (bf backfiller) step(ctx context.Context, db *sql.DB, j job) (lo, n, rest u
 		}
 	}
 	if err == nil {
-		err = tx.QueryRowContext(ctx, "SELECT coalesce(sum(hi - lo + 1), 0)::UBIGINT FROM backfill_gaps WHERE feature = ?", j.feature).Scan(&rest)
+		rest, err = gapRounds(ctx, tx, j.feature)
 	}
 	if err == nil {
 		err = tx.Commit()
