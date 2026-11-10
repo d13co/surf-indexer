@@ -19,6 +19,12 @@ const rekeysTable = `CREATE TABLE IF NOT EXISTS rekeys(
 	last_rnd  UINTEGER NOT NULL
 )`
 
+// rekeysIndexes serve /v0/rekeys and /v0/account's counts. DuckDB uses an ART index only for a scan
+// whose whole filter is one equality on its column, so those queries look up acct and auth apart.
+// Their upkeep adds some 0-40 ms to a merge of 100 to 10k pairs into 5M rows (~100-250 ms without).
+const rekeysIndexes = `CREATE INDEX IF NOT EXISTS rekeys_acct ON rekeys(acct);
+CREATE INDEX IF NOT EXISTS rekeys_auth ON rekeys(auth)`
+
 // rekeyFrom is each network's first round that can hold a rekey: where consensus v24
 // (SupportRekeying) switched on. The backfill skips the rounds before it. 0 on other networks.
 var rekeyFrom = map[string]uint64{"mainnet-v1.0": 8734690, "testnet-v1.0": 8841645, "betanet-v1.0": 5107702}

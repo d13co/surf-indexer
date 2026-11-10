@@ -250,6 +250,29 @@ func TestRekeySetup(t *testing.T) {
 	}
 	db.Close()
 
+	// A table made before its indexes were added gets them on the next start.
+	indexes := func(db *sql.DB) []string {
+		t.Helper()
+		return strs(t, db, "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'rekeys' ORDER BY 1")
+	}
+	if raw, err = sql.Open("duckdb", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("DROP INDEX rekeys_acct; DROP INDEX rekeys_auth"); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := indexes(db); !slices.Equal(got, []string{"rekeys_acct", "rekeys_auth"}) {
+		t.Errorf("indexes after reopening = %q", got)
+	}
+	if got := gaps(t, db); !slices.Equal(got, []string{"next 15", "1-9", "12-14"}) {
+		t.Errorf("gaps after building indexes = %q", got)
+	}
+	db.Close()
+
 	// Turned off with the table present: refused, the file unchanged.
 	before, _ := os.ReadFile(path)
 	if _, err := openWith(t, path, config{}); !errors.As(err, new(configErr)) || !strings.Contains(err.Error(), "drop-feature rekeys on ") {
@@ -266,6 +289,7 @@ func TestRekeySetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := strs(t, db, `SELECT 'x' FROM duckdb_tables() WHERE table_name = 'rekeys'
+		UNION ALL SELECT index_name FROM duckdb_indexes() WHERE table_name = 'rekeys'
 		UNION ALL SELECT feature FROM feature_sync UNION ALL SELECT feature FROM backfill_gaps`); len(got) > 0 {
 		t.Errorf("after drop-feature: %q", got)
 	}
@@ -839,6 +863,8 @@ func TestRekeyRoutes(t *testing.T) {
 	}{
 		{"/v0/rekeys/" + A, ok, `{"to":[` + e(A, 1, 4, 4) + "," + e(B, 2, 1, 3) + `],"from":[` + e(D, 1, 5, 5) + "," + e(C, 1, 2, 2) + `]}`},
 		{"/v0/rekeys/" + A + "?limit=1", ok, `{"to":[` + e(A, 1, 4, 4) + `],"from":[` + e(D, 1, 5, 5) + `]}`},
+		// The self row (round 4) is newer than C's: the limit counts from's rows after leaving it out.
+		{"/v0/rekeys/" + A + "?limit=2", ok, `{"to":[` + e(A, 1, 4, 4) + "," + e(B, 2, 1, 3) + `],"from":[` + e(D, 1, 5, 5) + "," + e(C, 1, 2, 2) + `]}`},
 		{"/v0/rekeys/" + B, ok, `{"to":[],"from":[` + e(A, 2, 1, 3) + `]}`},
 		{"/v0/rekeys/" + E, ok, `{"to":[],"from":[]}`},
 		{"/v0/rekeys/nope", 400, ""},
@@ -885,6 +911,56 @@ func TestRekeyRoutes(t *testing.T) {
 	h = routes(db)
 	if code, _ := get("/v0/rekeys/" + A); code != 404 {
 		t.Errorf("rekeys with the feature off = %d, want 404", code)
+	}
+}
+
+// The rekeys routes look up acct and auth through their indexes, not a scan of rekeys. Plain EXPLAIN
+// prints a sequential scan even when the index runs, so this reads EXPLAIN ANALYZE.
+func TestRekeyQueriesUseIndex(t *testing.T) {
+	defer func(c config) { track = c }(track)
+	db, err := openWith(t, "", config{Rekeys: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	A, B, C := addrOf(1), addrOf(2), addrOf(3)
+	if _, err := db.Exec("INSERT INTO rekeys VALUES (?, ?, 1, 1, 1), (?, ?, 1, 2, 2), (?, ?, 1, 3, 3)", A, B, C, A, A, A); err != nil {
+		t.Fatal(err)
+	}
+	// scans counts the plan's index and sequential scans.
+	scans := func(q string, args ...any) (index, seq int) {
+		t.Helper()
+		rows, err := db.Query("EXPLAIN ANALYZE "+q, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var k, plan string
+			if err := rows.Scan(&k, &plan); err != nil {
+				t.Fatal(err)
+			}
+			index, seq = index+strings.Count(plan, "Type: Index Scan"), seq+strings.Count(plan, "Type: Sequential Scan")
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return index, seq
+	}
+	for name, q := range map[string]struct {
+		sql  string
+		args []any
+	}{
+		"/v0/rekeys":  {rekeysSQL, []any{10, A}},
+		"/v0/account": {"SELECT to_json({" + strings.Join(rekeyCounts, ", ") + "})::VARCHAR", []any{A}},
+	} {
+		if index, seq := scans(q.sql, q.args...); index != 2 || seq != 0 {
+			t.Errorf("%s: %d index scans, %d sequential, want 2 and 0", name, index, seq)
+		}
+	}
+	// The check can see a scan: an OR of the two lookups is one.
+	if index, seq := scans("SELECT count(*) FROM rekeys WHERE acct = $1 OR auth = $1", A); index != 0 || seq != 1 {
+		t.Errorf("OR: %d index scans, %d sequential, want 0 and 1", index, seq)
 	}
 }
 

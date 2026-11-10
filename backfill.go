@@ -30,6 +30,7 @@ type job struct {
 	env     string                                                    // the variable that turns it on
 	on      func(c config) bool                                       // whether c has it on
 	table   string                                                    // its DDL, run when it is turned on; the table is named feature
+	indexes string                                                    // its indexes' DDL (IF NOT EXISTS), run on every start with it on
 	drop    string                                                    // drops its tables
 	from    func(genesisID string) uint64                             // the first round that can hold its rows
 	full    bool                                                      // needs the payset (else header only)
@@ -46,6 +47,7 @@ var rekeysJob = job{
 	env:     "REKEYS",
 	on:      func(c config) bool { return c.Rekeys },
 	table:   rekeysTable,
+	indexes: rekeysIndexes,
 	drop:    "DROP TABLE IF EXISTS rekeys",
 	from:    func(genesisID string) uint64 { return rekeyFrom[genesisID] },
 	full:    true,
@@ -111,12 +113,17 @@ func setupJob(tx *sql.Tx, j job, path, genesisID string, lo, hi int64) error {
 		}
 		return err
 	}
-	if !have { // being turned on; an empty DB gets no gap, as ingest covers every round
-		_, err := tx.Exec(j.table)
-		if err == nil {
-			err = clearJob()
+	if !have {
+		if _, err := tx.Exec(j.table); err != nil {
+			return err
 		}
-		if err != nil {
+	}
+	// On every start, so a table made before an index was added gets it.
+	if err := buildIndexes(tx, j, have); err != nil {
+		return err
+	}
+	if !have { // being turned on; an empty DB gets no gap, as ingest covers every round
+		if err := clearJob(); err != nil {
 			return err
 		}
 		return addGap(lo)
@@ -136,6 +143,25 @@ func setupJob(tx *sql.Tx, j job, path, genesisID string, lo, hi int64) error {
 		return addGap(next)
 	}
 	return nil
+}
+
+// buildIndexes creates j's missing indexes. On a table with rows (have), that takes a while (some
+// 15 s per index per 5M rows), so it is logged.
+func buildIndexes(tx *sql.Tx, j job, have bool) error {
+	const count = "SELECT count(*) FROM duckdb_indexes() WHERE table_name = ?"
+	var before, after int
+	start := time.Now()
+	err := tx.QueryRow(count, j.feature).Scan(&before)
+	if err == nil {
+		_, err = tx.Exec(j.indexes)
+	}
+	if err == nil {
+		err = tx.QueryRow(count, j.feature).Scan(&after)
+	}
+	if err == nil && have && after > before {
+		slog.Info("built indexes", "feature", j.feature, "indexes", after-before, "took", time.Since(start).Round(time.Millisecond).String())
+	}
+	return err
 }
 
 // dropJob drops j's tables and its rows in the shared ones.

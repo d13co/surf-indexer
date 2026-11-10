@@ -539,15 +539,7 @@ func routes(db *sql.DB) http.Handler {
 				h(w, r)
 			})
 		}
-		// rows lists the newest $1 of r's rows matching where, the other side of the pair as address.
-		// ponytail: no index, so each request scans rekeys; add one if it gets big.
-		rows := func(other, where string) string {
-			newest := " ORDER BY last_rnd DESC, " + other
-			return `coalesce((SELECT list({'address': ` + other + `, 'txns': txns, 'firstRound': first_rnd, 'lastRound': last_rnd}` + newest + `)
-				FROM (SELECT * FROM r WHERE ` + where + newest + ` LIMIT $1)), [])`
-		}
-		limited(whenReady, "GET /v0/rekeys/{addr}", `WITH r AS MATERIALIZED (SELECT * FROM rekeys WHERE acct = $2 OR auth = $2)
-			SELECT to_json({'to': `+rows("auth", "acct = $2")+`, 'from': `+rows("acct", "auth = $2 AND acct <> $2")+`})::VARCHAR`)
+		limited(whenReady, "GET /v0/rekeys/{addr}", rekeysSQL)
 	}
 	if track.Proposers || track.VoterRounds > 0 {
 		light("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
@@ -558,8 +550,9 @@ func routes(db *sql.DB) http.Handler {
 		})
 	}
 	// What algo.surf's account page needs to pick its tabs before fetching any list: a scan of each
-	// tracked table (~40–50 ms on mainnet), against one request per list. Keys of untracked features,
-	// and of backfillable ones not yet backfilled, are left out; an address never seen gets zeros.
+	// tracked table (~40–50 ms on mainnet) but rekeys, two index lookups, against one request per
+	// list. Keys of untracked features, and of backfillable ones not yet backfilled, are left out; an
+	// address never seen gets zeros.
 	if track.Lsigs || track.Msigs || track.Proposers || track.VoterRounds > 0 || track.Rekeys {
 		var keys, from []string
 		if track.Lsigs {
@@ -591,10 +584,8 @@ func routes(db *sql.DB) http.Handler {
 			return q
 		}
 		q, qRekeys := build(keys, from), ""
-		if track.Rekeys { // both counts in one scan; to includes the self row, as in /v0/rekeys
-			qRekeys = build(append(slices.Clip(keys), `'rekeysTo': k.rekeysTo`, `'rekeysFrom': k.rekeysFrom`),
-				append(slices.Clip(from), `(SELECT count(*) FILTER (WHERE acct = $1) AS rekeysTo, count(*) FILTER (WHERE auth = $1 AND acct <> $1) AS rekeysFrom
-				FROM rekeys WHERE acct = $1 OR auth = $1) k`))
+		if track.Rekeys {
+			qRekeys = build(append(slices.Clip(keys), rekeyCounts...), from)
 		}
 		light("GET /v0/account/{addr}", func(w http.ResponseWriter, r *http.Request) {
 			q := q
@@ -632,6 +623,29 @@ func routes(db *sql.DB) http.Handler {
 			"ms", float64(time.Since(t).Microseconds())/1000, "remote", r.RemoteAddr, "client", key)
 	})
 }
+
+// rekeysSQL is /v0/rekeys's query: an account's newest $1 authorizers (to, its own self row
+// included) and the newest $1 accounts rekeyed to it (from). Each side is one equality on an indexed
+// column, materialized before any other filter: an OR, or an AND pushed into the scan, would turn
+// the index lookup back into a scan of rekeys (rekeysIndexes).
+var rekeysSQL = func() string {
+	// rows lists the newest $1 of cte's rows matching where (if any), the other side of the pair as address.
+	rows := func(cte, other, where string) string {
+		newest := " ORDER BY last_rnd DESC, " + other
+		if where != "" {
+			where = " WHERE " + where
+		}
+		return `coalesce((SELECT list({'address': ` + other + `, 'txns': txns, 'firstRound': first_rnd, 'lastRound': last_rnd}` + newest + `)
+			FROM (SELECT * FROM ` + cte + where + newest + ` LIMIT $1)), [])`
+	}
+	return `WITH t AS MATERIALIZED (SELECT * FROM rekeys WHERE acct = $2), f AS MATERIALIZED (SELECT * FROM rekeys WHERE auth = $2)
+		SELECT to_json({'to': ` + rows("t", "auth", "") + `, 'from': ` + rows("f", "acct", "acct <> $2") + `})::VARCHAR`
+}()
+
+// rekeyCounts are /v0/account's rekeys keys, the lengths of /v0/rekeys's lists (to includes the
+// self row). One equality on an indexed column each, as in rekeysSQL.
+var rekeyCounts = []string{`'rekeysTo': (SELECT count(*) FROM rekeys WHERE acct = $1)`,
+	`'rekeysFrom': (SELECT count(*) FILTER (WHERE acct <> $1) FROM rekeys WHERE auth = $1)`}
 
 // cacheFor is the Cache-Control a GET's (or HEAD's) 200 gets, so browsers and a caching proxy can
 // answer repeats. The tip moves every ~3 s: status is kept for 2 s, the rest for 10 s.
