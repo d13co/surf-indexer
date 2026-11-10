@@ -258,15 +258,18 @@ func TestRekeySetup(t *testing.T) {
 	if raw, err = sql.Open("duckdb", path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec("DROP INDEX rekeys_acct; DROP INDEX rekeys_auth"); err != nil {
+	if _, err := raw.Exec("DROP INDEX rekeys_acct; DROP INDEX rekeys_auth; INSERT INTO rekeys SELECT 'a' || i, 'b' || (i % 7), 1, i, i FROM range(5000) t(i)"); err != nil {
 		t.Fatal(err)
 	}
 	raw.Close()
 	if db, err = openWith(t, path, config{Rekeys: true}); err != nil {
 		t.Fatal(err)
 	}
-	if got := indexes(db); !slices.Equal(got, []string{"rekeys_acct", "rekeys_auth"}) {
-		t.Errorf("indexes after reopening = %q", got)
+	if got, n := indexes(db), strs(t, db, "SELECT count(*) FROM rekeys"); !slices.Equal(got, []string{"rekeys_acct", "rekeys_auth"}) || !slices.Equal(n, []string{"5000"}) {
+		t.Errorf("indexes after reopening = %q, rows %q", got, n)
+	}
+	if _, err := db.Exec("DELETE FROM rekeys"); err != nil { // the rest of the test expects none
+		t.Fatal(err)
 	}
 	if got := gaps(t, db); !slices.Equal(got, []string{"next 15", "1-9", "12-14"}) {
 		t.Errorf("gaps after building indexes = %q", got)

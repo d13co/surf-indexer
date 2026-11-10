@@ -21,6 +21,8 @@ const rekeysTable = `CREATE TABLE IF NOT EXISTS rekeys(
 
 // rekeysIndexes serve /v0/rekeys and /v0/account's counts. DuckDB uses an ART index only for a scan
 // whose whole filter is one equality on its column, so those queries look up acct and auth apart.
+// It also scans when the match is big (over index_scan_max_count, 2048 rows by default, and
+// index_scan_percentage of the table): an authorizer of thousands of accounts costs a scan, as before.
 // Their upkeep adds some 0-40 ms to a merge of 100 to 10k pairs into 5M rows (~100-250 ms without).
 const rekeysIndexes = `CREATE INDEX IF NOT EXISTS rekeys_acct ON rekeys(acct);
 CREATE INDEX IF NOT EXISTS rekeys_auth ON rekeys(auth)`

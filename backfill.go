@@ -145,13 +145,19 @@ func setupJob(tx *sql.Tx, j job, path, genesisID string, lo, hi int64) error {
 	return nil
 }
 
-// buildIndexes creates j's missing indexes. On a table with rows (have), that takes a while (some
-// 15 s per index per 5M rows), so it is logged.
+// buildIndexes creates j's missing indexes. On an existing table (have), that takes a while (some
+// 15 s per index per 5M rows) before the service serves, so it is logged before and after.
 func buildIndexes(tx *sql.Tx, j job, have bool) error {
+	if j.indexes == "" {
+		return nil
+	}
 	const count = "SELECT count(*) FROM duckdb_indexes() WHERE table_name = ?"
 	var before, after int
 	start := time.Now()
 	err := tx.QueryRow(count, j.feature).Scan(&before)
+	if want := strings.Count(j.indexes, "CREATE INDEX"); err == nil && have && before < want {
+		slog.Info("building indexes", "feature", j.feature, "missing", want-before)
+	}
 	if err == nil {
 		_, err = tx.Exec(j.indexes)
 	}
@@ -376,8 +382,8 @@ func runBackfill(ctx context.Context, db *sql.DB, bf backfiller) {
 
 // drainBackfill fills every tracked feature's gaps up to the source's tip and returns, stopping at
 // the first error. A LEDGER_DB import runs it, from the ledger file: the fast path for a large
-// backfill. Rounds past the ledger's tip (a live DB ahead of it) are left, with a warning, for the
-// service's runner to fill from the BACKFILL_ALGOD_* algods.
+// backfill. Rounds past the ledger's tip (a live DB ahead of it, or a short ledger file: the two look
+// the same) are left, with a warning, for the service's runner to fill from the BACKFILL_ALGOD_* algods.
 func drainBackfill(ctx context.Context, db *sql.DB, bf backfiller) error {
 	for j := range trackedJobs() {
 		start := time.Now()
@@ -385,12 +391,12 @@ func drainBackfill(ctx context.Context, db *sql.DB, bf backfiller) error {
 		for {
 			lo, n, rest, err := bf.step(ctx, db, j)
 			if b := (errBehind{}); errors.As(err, &b) {
-				n, err := gapRounds(ctx, db, j.feature)
+				gap, err := gapRounds(ctx, db, j.feature)
 				if err != nil {
 					return fmt.Errorf("backfill %s: %w", j.feature, err)
 				}
-				setLeft(j.feature, n) // for importLedger's last log line
-				slog.Warn("backfill left to the service", "feature", j.feature, "next", b.lo, "sourceTip", b.tip, "roundsLeft", n)
+				setLeft(j.feature, gap) // for importLedger's last log line
+				slog.Warn("backfill left to the service", "feature", j.feature, "next", b.lo, "sourceTip", b.tip, "roundsLeft", gap)
 				break
 			}
 			if err != nil {

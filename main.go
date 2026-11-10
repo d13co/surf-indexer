@@ -131,7 +131,7 @@ func importLedger(ctx context.Context, path, genesisID, dbID string, concurrency
 		fatal("ledger import", "err", err)
 	}
 	if l := roundsLeft(); l != nil { // past the ledger's tip: the service fills them from algod
-		slog.Info("ledger import done, db closed", "backfillLeft", l)
+		slog.Warn("ledger import done, db closed", "backfillLeft", l)
 	} else {
 		slog.Info("ledger import done, db closed")
 	}
