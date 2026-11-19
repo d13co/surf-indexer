@@ -942,6 +942,20 @@ func TestRekeyRoutes(t *testing.T) {
 			t.Errorf("%s = %d %s, want %d %s", c.url, code, body, c.code, c.want)
 		}
 	}
+	// RESULTS_LIMIT caps limit, and /v0/status says so.
+	func() {
+		defer func(n uint64) { maxLimit = n }(maxLimit)
+		maxLimit = 2
+		for url, want := range map[string]int{"/v0/rekeys/" + A + "?limit=2": ok, "/v0/rekeys/" + A + "?limit=3": 400} {
+			if code, body := get(url); code != want {
+				t.Errorf("RESULTS_LIMIT=2: %s = %d %s, want %d", url, code, body, want)
+			}
+		}
+		if _, body := get("/v0/status"); !strings.Contains(body, `"resultsLimit":2,`) {
+			t.Errorf("RESULTS_LIMIT=2: /v0/status = %s", body)
+		}
+	}()
+
 	// Each account count is the length of its list.
 	for _, a := range []string{A, B, C, D, E} {
 		var acc struct{ RekeysTo, RekeysFrom int }

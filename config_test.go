@@ -133,9 +133,9 @@ func TestReadEnvFile(t *testing.T) {
 func TestLoadConfigErrors(t *testing.T) {
 	clearEnv(t)
 	setEnv(t, map[string]string{"PORT": "70000", "LSIGS": "maybe", "VOTER_ROUNDS": "-1", "ADMIN_TOKEN": "short", "DUCKDB_MEMORY_LIMIT": "lots",
-		"REKEYS": "maybe", "BACKFILL_CONCURRENCY": "0", "BACKFILL_RATE": "-1"})
+		"REKEYS": "maybe", "BACKFILL_CONCURRENCY": "0", "BACKFILL_RATE": "-1", "RESULTS_LIMIT": "0"})
 	_, err := loadConfig()
-	for _, s := range []string{"PORT", "LSIGS", "VOTER_ROUNDS", "ADMIN_TOKEN", "DUCKDB_MEMORY_LIMIT", "REKEYS", "BACKFILL_CONCURRENCY", "BACKFILL_RATE"} {
+	for _, s := range []string{"PORT", "LSIGS", "VOTER_ROUNDS", "ADMIN_TOKEN", "DUCKDB_MEMORY_LIMIT", "REKEYS", "BACKFILL_CONCURRENCY", "BACKFILL_RATE", "RESULTS_LIMIT"} {
 		if err == nil || !strings.Contains(err.Error(), s) {
 			t.Errorf("want %s in %v", s, err)
 		}
@@ -143,8 +143,13 @@ func TestLoadConfigErrors(t *testing.T) {
 
 	clearEnv(t)
 	setEnv(t, map[string]string{"LISTEN_ADDR": "[::1]", "PORT": "9"})
-	if s, err := loadConfig(); err != nil || s.listen != "[::1]:9" || len(s.dbOptions) != 0 || s.backfill != (backfillConfig{concurrency: 4, rate: 100}) {
-		t.Errorf("got %q %v %+v, %v", s.listen, s.dbOptions, s.backfill, err)
+	if s, err := loadConfig(); err != nil || s.listen != "[::1]:9" || len(s.dbOptions) != 0 || s.backfill != (backfillConfig{concurrency: 4, rate: 100}) ||
+		s.resultsLimit != 100000 {
+		t.Errorf("got %q %v %+v %d, %v", s.listen, s.dbOptions, s.backfill, s.resultsLimit, err)
+	}
+	setEnv(t, map[string]string{"RESULTS_LIMIT": "250000"})
+	if s, err := loadConfig(); err != nil || s.resultsLimit != 250000 {
+		t.Errorf("RESULTS_LIMIT=250000: got %d, %v", s.resultsLimit, err)
 	}
 }
 

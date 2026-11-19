@@ -42,10 +42,12 @@ All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC 
 `/v0/status`
 
 ```
-{"ok":1,"maxRound":46513899,"records":46513900,"proposers":true,"voterRounds":100000,"lsigs":true,"msigs":true}
+{"ok":1,"maxRound":46513899,"records":46513900,"resultsLimit":100000,"proposers":true,"voterRounds":100000,"lsigs":true,"msigs":true}
 ```
 
 Sanity check: `records` should be `maxRound + 1` (round 0 is stored), or `maxRound + 1 - START_ROUND` for a trial. Both come from memory, not a query: counted when the DB opens, then kept in step with each insert.
+
+`resultsLimit` is `RESULTS_LIMIT`, the most entries a list returns: a larger `limit` gets 400, so a client that wants a whole list asks for this many.
 
 `proposers`, `voterRounds`, `lsigs`, `msigs` and `rekeys` are the `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS`, `MSIGS` and `REKEYS` this instance runs with. A feature that is off (`false`, or `voterRounds` 0) has no routes: they return 404. Clients should check these before calling the feature routes, since several of those also use 404 to mean "not seen".
 
@@ -188,7 +190,7 @@ Unchanged: paths, JSON keys, `pp` omitted when 0, the stats shape, eviction orde
 
 These routes exist only with `LSIGS` on; otherwise they 404.
 
-Every txn authorized by a logic sig is indexed (inner txns have none): by an escrow, where the authorizer is the program's own address, or by a delegation, where an account signed the program (by sig, msig, lmsig or pqsig). Rows are per program, delegator and rekeyed sender, without per-round history, so lists of uses are newest first by `lastRound`, and every list is capped by `limit` (default 1000, at most 100000). A use:
+Every txn authorized by a logic sig is indexed (inner txns have none): by an escrow, where the authorizer is the program's own address, or by a delegation, where an account signed the program (by sig, msig, lmsig or pqsig). Rows are per program, delegator and rekeyed sender, without per-round history, so lists of uses are newest first by `lastRound`, and every list is capped by `limit` (default 1000, at most [`RESULTS_LIMIT`](#environment-variables), 100000 by default). A use:
 
 ```
 {"lsig":"…","template":"3f2c9a1b7d0e4c55","signer":null,"sender":null,"txns":12,"firstRound":46000000,"lastRound":46500000}
@@ -216,7 +218,7 @@ Every txn authorized by a logic sig is indexed (inner txns have none): by an esc
 
 These routes exist only with `MSIGS` on; otherwise they 404.
 
-Every multisig that authorized a top-level txn is indexed (inner txns have none): the txn's own msig, or one that signed its delegated logic sig (msig or lmsig). The multisig address comes from its preimage, so it is the txn's authorizer, which differs from the sender when rekeyed. There is one row per subsigner and multisig, without history, pointing at one txn: the first the subsigner signed, or while it never has, the first that used the multisig. Lists are newest pointer first and capped by `limit` (default 1000, at most 100000). A row:
+Every multisig that authorized a top-level txn is indexed (inner txns have none): the txn's own msig, or one that signed its delegated logic sig (msig or lmsig). The multisig address comes from its preimage, so it is the txn's authorizer, which differs from the sender when rekeyed. There is one row per subsigner and multisig, without history, pointing at one txn: the first the subsigner signed, or while it never has, the first that used the multisig. Lists are newest pointer first and capped by `limit` (default 1000, at most [`RESULTS_LIMIT`](#environment-variables), 100000 by default). A row:
 
 ```
 {"msig":"…","signed":true,"round":46500000,"index":3}
@@ -248,7 +250,7 @@ Every change of an account's authorizer is indexed, inner txns included (apps re
 - `from`: the accounts rekeyed to this address.
 - `txns`: the txns that set the account's authorizer to `address`. `firstRound`, `lastRound`: the first and last of them. Round and sender (and `rekey-to`) find a txn in an indexer.
 
-Each list is newest `lastRound` first and capped by `limit` (default 1000, at most 100000). An address never seen gets `{"to":[],"from":[]}`. The current authorizer is algod's (`auth-addr` on the account): two changes in one round aren't ordered here.
+Each list is newest `lastRound` first and capped by `limit` (default 1000, at most [`RESULTS_LIMIT`](#environment-variables), 100000 by default). An address never seen gets `{"to":[],"from":[]}`. The current authorizer is algod's (`auth-addr` on the account): two changes in one round aren't ordered here.
 
 ### Account summary
 
@@ -425,6 +427,7 @@ Turning `REKEYS` off for a DB that has it is refused (exit 78), so a missing env
 | ADMIN_TOKEN | Enables the [admin](#admin) routes (needs `LSIGS`); 16+ printable ASCII characters, no spaces, e.g. `openssl rand -hex 32` |                  |
 | RATE_LIMIT  | Per-client requests/s across all routes, burst 5×; 0 for no per-client limits ([rate limits](#rate-limits)) | 10 |
 | HEAVY_CONCURRENCY | Heavy requests running at once, across all clients; 0 for no cap | 4 |
+| RESULTS_LIMIT | The most entries a list returns: the cap on each list route's `limit`, and on the `/v0/templates` list | 100000 |
 | REAL_IP_HEADER | Header holding the visitor IP behind a proxy, read only from a loopback or private peer, e.g. `CF-Connecting-IP` |  |
 | DUCKDB_MEMORY_LIMIT | DuckDB memory cap, e.g. `2GB`; DuckDB's default is 80% of RAM |  |
 | DUCKDB_THREADS | DuckDB worker threads; 0 for DuckDB's default (every core) | 0 |

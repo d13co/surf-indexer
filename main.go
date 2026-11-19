@@ -174,6 +174,7 @@ func main() {
 		fatalConfig("config", "err", err)
 	}
 	track, adminToken, limits, startRound, dbOptions = s.track, s.adminToken, s.limits, s.startRound, s.dbOptions
+	maxLimit = s.resultsLimit
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

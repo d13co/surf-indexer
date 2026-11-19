@@ -986,7 +986,7 @@ func TestProposerRoutes(t *testing.T) {
 		{"/v0/exists/@C", ok, `{"exists":true}`},
 		{"/v0/exists/@D", ok, `{"exists":false}`},
 		{"/v0/exists/nope", 400, ""},
-		{"/v0/status", ok, `{"ok":1,"maxRound":5,"records":6,"proposers":true,"voterRounds":100,"lsigs":false,"msigs":false,"rekeys":false}`},
+		{"/v0/status", ok, `{"ok":1,"maxRound":5,"records":6,"resultsLimit":100000,"proposers":true,"voterRounds":100,"lsigs":false,"msigs":false,"rekeys":false}`},
 	} {
 		code, body := get(r.Replace(c.url))
 		if code != c.code || (c.code == ok && body != r.Replace(c.want)) {

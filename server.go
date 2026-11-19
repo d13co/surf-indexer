@@ -36,12 +36,15 @@ func parseTime(s string) (uint64, error) {
 
 func parseRound(s string) (uint64, error) { return strconv.ParseUint(s, 10, 32) }
 
-const maxLimit = 100000
+// maxLimit caps every list's limit, and the templates list: RESULTS_LIMIT, set at startup.
+var maxLimit uint64 = defaultResultsLimit
+
+const defaultResultsLimit = 100000
 
 func parseLimit(s string) (uint64, error) {
 	n, err := strconv.ParseUint(s, 10, 32)
 	if err == nil && (n < 1 || n > maxLimit) {
-		err = errors.New("want 1 to 100000")
+		err = fmt.Errorf("want 1 to %d", maxLimit)
 	}
 	return n, err
 }
@@ -220,9 +223,11 @@ func routes(db *sql.DB) http.Handler {
 			OK       int   `json:"ok"`
 			MaxRound int64 `json:"maxRound"`
 			Records  int64 `json:"records"`
+			// The most entries a list returns (its limit's cap): a client wanting all asks for this many.
+			ResultsLimit uint64 `json:"resultsLimit"`
 			config
 			Backfill map[string]progress `json:"backfill,omitempty"`
-		}{1, s.hi, s.n, c, backfill}, nil)
+		}{1, s.hi, s.n, maxLimit, c, backfill}, nil)
 	})
 
 	light("GET /v0/block", func(w http.ResponseWriter, r *http.Request) {
@@ -463,7 +468,7 @@ func routes(db *sql.DB) http.Handler {
 					cIDs[i], cNs[i], cByID[t.Template] = t.Template, t.Programs, t.Programs
 				}
 				cSrc, cSet = s, true
-				cComplete = len(list) < maxLimit || list[len(list)-1].Programs < 2
+				cComplete = uint64(len(list)) < maxLimit || list[len(list)-1].Programs < 2
 			}
 			return cIDs, cNs, cByID, cComplete, nil
 		}

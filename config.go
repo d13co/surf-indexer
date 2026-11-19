@@ -39,7 +39,7 @@ var knownEnv = []string{
 	"PORT", "LISTEN_ADDR", "ALGOD_HOST", "ALGOD_PORT", "ALGOD_TOKEN", "CONCURRENCY", "DB_CHUNKS",
 	"LEDGER_DB", "PROPOSERS", "VOTER_ROUNDS", "LSIGS", "MSIGS", "REKEYS", "ADMIN_TOKEN", "RATE_LIMIT",
 	"BACKFILL_ALGOD_HOST", "BACKFILL_ALGOD_PORT", "BACKFILL_ALGOD_TOKEN", "BACKFILL_CONCURRENCY", "BACKFILL_RATE",
-	"HEAVY_CONCURRENCY", "REAL_IP_HEADER", "START_ROUND", "DUCKDB_MEMORY_LIMIT", "DUCKDB_THREADS",
+	"HEAVY_CONCURRENCY", "RESULTS_LIMIT", "REAL_IP_HEADER", "START_ROUND", "DUCKDB_MEMORY_LIMIT", "DUCKDB_THREADS",
 	"DB_ID", // read by the unit only, which passes it as the dbID argument
 }
 
@@ -48,6 +48,7 @@ type settings struct {
 	track              config
 	adminToken         string
 	limits             limitConfig
+	resultsLimit       uint64 // maxLimit
 	startRound         uint64
 	concurrency, chunk int
 	ledger             string
@@ -102,6 +103,7 @@ func loadConfig() (s settings, err error) {
 	}
 	s.limits = limitConfig{Rate: r.int("RATE_LIMIT", 10, 0, math.MaxInt), Heavy: r.int("HEAVY_CONCURRENCY", 4, 0, math.MaxInt),
 		RealIPHeader: os.Getenv("REAL_IP_HEADER")}
+	s.resultsLimit = uint64(r.int("RESULTS_LIMIT", defaultResultsLimit, 1, math.MaxUint32))
 	s.startRound = uint64(r.int("START_ROUND", 0, 0, math.MaxUint32))
 	s.concurrency, s.chunk = r.int("CONCURRENCY", 10, 1, math.MaxInt), r.int("DB_CHUNKS", 1000, 1, math.MaxInt)
 	s.ledger = os.Getenv("LEDGER_DB")
