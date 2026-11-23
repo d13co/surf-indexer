@@ -183,11 +183,12 @@ func main() {
 	slog.Info("config", "version", version, "genesisID", genesisID, "dbID", dbID, "concurrency", concurrency, "chunk", chunk, "ledgerDB", s.ledger, "listen", s.listen,
 		"proposers", track.Proposers, "voterRounds", track.VoterRounds, "lsigs", track.Lsigs, "msigs", track.Msigs, "rekeys", track.Rekeys, "startRound", startRound, "admin", adminToken != "",
 		"rateLimit", limits.Rate, "heavyConcurrency", limits.Heavy, "realIPHeader", limits.RealIPHeader, "duckdb", dbOptions.Encode(),
-		"backfillConcurrency", s.backfill.concurrency, "backfillRate", s.backfill.rate)
-	if s.ledger != "" {
+		"backfillConcurrency", s.backfill.concurrency, "backfillRate", s.backfill.rate, "specsDir", s.specsDir)
+	if s.ledger != "" { // specsDir stays "", dropping the spec tables: the service reloads them on every start
 		importLedger(ctx, s.ledger, genesisID, dbID, concurrency, chunk)
 		return
 	}
+	specsDir = s.specsDir
 
 	a, err := algodClients(false, concurrency)
 	if err != nil {
@@ -224,6 +225,13 @@ func main() {
 		ingest(ctx, db, algodSource(a, genesisID, nil), concurrency, chunk)
 		close(done)
 	}()
+	sdone := make(chan struct{})
+	go func() {
+		if specsDir != "" {
+			watchSpecs(ctx, db, specsDir)
+		}
+		close(sdone)
+	}()
 	bdone := make(chan struct{})
 	if len(roundsLeft()) == 0 {
 		close(bdone)
@@ -256,6 +264,7 @@ func main() {
 	srv.Shutdown(context.Background())
 	<-done
 	<-bdone
+	<-sdone
 	if err := db.Close(); err != nil {
 		slog.Error("db close", "err", err)
 	}

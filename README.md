@@ -20,6 +20,7 @@ API should be considered **unstable**.
 | [Multisig subsigners](#multisig-subsigners) | Which multisigs a key belongs to, the subsigners of a multisig, and whether each key ever signed | `MSIGS` (off) | `/v0/subsigner/<address>`, `/v0/msig/<address>` |
 | [Rekeys](#rekeys) | Every authorizer an account was ever rekeyed to, and every account ever rekeyed to an address, with first and last round and count | `REKEYS` (off) | `/v0/rekeys/<address>` |
 | [Account summary](#account-summary) | What every enabled feature knows of an address, in one request | any of the five above | `/v0/account/<address>` |
+| [Specs](#specs) | Which ARC-56/32/4 app specs, harvested from GitHub, match a program's hash; which signatures have a method or event selector; where each spec was seen; a commit's source files | `SPECS_DIR` | `/v0/program/<hash>`, `/v0/selector/<sel>`, `/v0/spec/<blob>`, `/v0/files/<commit>` |
 | [Admin](#admin) | Name logic sig templates (e.g. "Tinyman v1 pool") | `ADMIN_TOKEN` | `PUT`/`DELETE /v0/admin/template/<id>` |
 
 [`/v0/status`](#status) reports the tip and which features this instance runs with. Every response allows any origin (`Access-Control-Allow-Origin: *`), so browsers can call it directly, and clients are [rate limited](#rate-limits) per IP.
@@ -48,6 +49,8 @@ All timestamps are unix seconds. Wherever a time is accepted, `YYYY-MM-DD` (UTC 
 Sanity check: `records` should be `maxRound + 1` (round 0 is stored), or `maxRound + 1 - START_ROUND` for a trial. Both come from memory, not a query: counted when the DB opens, then kept in step with each insert.
 
 `resultsLimit` is `RESULTS_LIMIT`, the most entries a list returns: a larger `limit` gets 400, so a client that wants a whole list asks for this many.
+
+`specs` is `false` without `SPECS_DIR`, else the [specs](#specs) loaded: `{"count":8123,"loadedAt":1763856000}`, `loadedAt` in unix seconds. Specs persist in the DB, so after a restart it shows the last load until the next one ends; never loaded, it is `{"count":0,"loadedAt":0}`.
 
 `proposers`, `voterRounds`, `lsigs`, `msigs` and `rekeys` are the `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS`, `MSIGS` and `REKEYS` this instance runs with. A feature that is off (`false`, or `voterRounds` 0) has no routes: they return 404. Clients should check these before calling the feature routes, since several of those also use 404 to mean "not seen".
 
@@ -270,6 +273,45 @@ Each list is newest `lastRound` first and capped by `limit` (default 1000, at mo
 
 Keys of features that are off, or still backfilling, are left out, and an address never seen gets zeros and `false`. With all five off the route 404s, and with only `REKEYS` on it 404s until backfilled. Not ranged and never heavy.
 
+### Specs
+
+These routes exist only with `SPECS_DIR` set; otherwise they 404.
+
+`SPECS_DIR` is the absolute path of a directory holding the export of sigreg's GitHub harvester ([ingest-github](https://github.com/d13co/sigreg)): `specs.jsonl`, one ARC-56, ARC-32 or ARC-4 spec file per line, and `trees.jsonl`, the `.ts`, `.mts` and `.py` paths of each scanned commit. It is the same for every network. `trees.jsonl` is optional: without it the specs load and `/v0/files` lists nothing. The service loads the files at start, then checks them every 10 minutes and reloads when either changed (mtime or size), once both have stayed the same across two checks 30 s apart, whatever their mtimes say. That only guards against a writer still at work: the exporter must replace each file atomically (write it elsewhere in the same filesystem, then rename it into place), as a truncated or empty file that stops changing is loaded as it is. A load replaces every spec in one transaction, so a reply never mixes two loads. A failed load, or a missing `specs.jsonl`, logs an error, keeps serving the last load (or nothing) and is retried every 10 minutes; `surf-indexer check` fails on a missing `specs.jsonl` (more often a typo than an export not made yet), and warns when `trees.jsonl` is missing or `SPECS_DIR` is under `/home`, `/root` or `/run/user`, which the systemd unit can't read (`ProtectHome=true`). The log line `specs loaded` counts what was kept and dropped. A [bulk load](#bulk-load-from-an-archival-nodes-ledger) ignores `SPECS_DIR` and drops the spec tables, which the service reloads at its next start.
+
+Everything in the files comes from GitHub repos, any of which may be hostile, so it is checked on load and anything malformed is dropped: a line over 4 MB or a spec with a bad blob or kind whole, otherwise the bad entry alone. Hex is lowercased; owners, repos, paths and refs follow GitHub's and git's rules (no `.`/`..` segment, `\`, control, zero-width, text-direction or blank-looking characters); signatures must parse as ARC-4 methods (reference and transaction types as args only, `void` as a return only) or ARC-28 events. Selectors are computed from each signature, never read from the file. Program hashes are kept for ARC-56 specs only: they are of its `byteCode`, which ARC-32 and ARC-4 specs don't have. Owners and repos are compared case-insensitively, as GitHub does. Counts are capped: 512 methods and 512 events per spec, 200 sources (non-mirror and with a commit kept first), 3000 paths per commit, and per load 200,000 specs, 1M methods, 200,000 events, 500,000 sources, 200,000 commits and 5M paths. **None of it is verified here**: a spec's names are its author's claims, and so are its sources: owners and `mirror` come from the harvested repos, and a set of hostile repos can make up any number of owners. Rankings by owners are a hint; what counts is the client's own check of the fetched file's git blob SHA against `blob` and of its `byteCode` against the program, before using it.
+
+Every 200 is cached for 10 minutes (`max-age=600`); hex keys may be any case. `/v0/program` and `/v0/selector` list at most 20 entries and say when there were more; the other routes' lists are bounded by the caps above.
+
+`/v0/program/<hash>`: the specs whose approval or clear `byteCode` hashes (SHA-512/256, 64 hex digits) to `hash`. First those seen in any non-mirror repo, by the number of distinct non-mirror owners, then by `blob`. `[]` if none. Over 20, the first 20 come with the header `X-Truncated: 20`. It is [heavy](#rate-limits): a program can be every spec's (a clear program often is), and its cost grows with the tables.
+
+```
+[{"blob":"3b18…","kind":"arc56","name":"TimeSeek","prog":"approval","methods":7,"events":1,"seenTotal":2,
+  "seen":[{"owner":"alice","repo":"timeseek","path":"contracts/TimeSeek.arc56.json","ref":"v1.2.0","refType":"tag","commit":"9f2c…","mirror":false}, …]}]
+```
+
+- `blob`: the spec file's git blob SHA-1; `prog`: `approval` or `clear`; `methods`, `events`: their counts
+- `seen`: the first 10 of where the harvester saw the file, non-mirror first, then with a commit; `seenTotal` is how many there are (all in `/v0/spec`). `ref` is the branch or tag scanned (`refType` `branch` or `tag`), `commit` its commit (`null` if not recorded; fetch by `ref` then, as the blob check catches a change). `mirror` marks a registry repo holding copies of others' specs, such as `ARC56Registry`.
+
+`/v0/selector/<sel>`: every method and event signature whose selector (8 hex digits) is `sel`, collisions included: first those with the most distinct non-mirror `owners` across their specs, then the most `specs`, as one repo can make any number of specs. Each spec counts at most 10 of its owners toward `owners` (the first by name, case-insensitive), which keeps counting them cheap on load whatever sources a spec claims. `args` are the arg names of a method's most owners, then specs (`""` for one that was refused). `truncated` is true when either list had more than 20. `{"methods":[],"events":[],"truncated":false}` if none. Which signature is behind a selector stays a claim: 4 bytes can be ground in ~2³² hashes.
+
+```
+{"methods":[{"sig":"add(uint64,uint64)uint128","args":["a","b"],"owners":9,"specs":12}],"events":[],"truncated":false}
+```
+
+`/v0/spec/<blob>`: one spec, or 404: every method and event (at most 512 each), by signature, and every source (at most 200), ordered as in `/v0/program`.
+
+```
+{"kind":"arc56","name":"TimeSeek","methods":[{"sig":"roundAt(uint64,uint64)(uint64,uint64,uint64,uint64)","args":["at","home"],"readonly":true}],
+ "events":[{"sig":"Registered(byte[4],string)"}],"seen":[…]}
+```
+
+`/v0/files/<commit>`: the `.ts`, `.mts` and `.py` paths (outside `node_modules`, at most 3000) of a commit the harvester scanned (40 hex digits), sorted. `[]` if none or not scanned.
+
+```
+["contracts/TimeSeek.algo.ts","tests/timeseek.test.ts"]
+```
+
 ### Admin
 
 These routes exist only with `ADMIN_TOKEN` set, which needs `LSIGS` on (startup fails otherwise); without it they 404. Each needs the header `Authorization: Bearer <ADMIN_TOKEN>`, else 401. They are meant for curl, not browsers: there is no CORS preflight.
@@ -286,13 +328,13 @@ Names are stored in the DB (`template_names`), so a rebuilt DB starts without th
 
 ### Rate limits
 
-Each client (IP address, an IPv6 one as its /64) gets `RATE_LIMIT` requests per second across all routes, in bursts of up to 5× that (default 10/s, burst 50). Heavy requests also take one of 30 per minute, in bursts of up to 10. Heavy are `/v0/series`, `/v0/fees` (not `/v0/fees/<period>`), `/v0/templates`, and any [proposer or voter](#proposers-and-voters) route taking a round range (`/v0/proposers`, `/v0/proposer/<address>` and its `/stats`, `/v0/payouts/highest`, `/v0/evictions` and `/v0/evictions/<address>`, `/v0/voters`, `/v0/voter/<address>`) when that range, up to the tip, covers 5M rounds (~6 months) or more: by default it is all of history. Over either limit, a request gets **429** with `Retry-After` (seconds). `RATE_LIMIT=0` turns these off.
+Each client (IP address, an IPv6 one as its /64) gets `RATE_LIMIT` requests per second across all routes, in bursts of up to 5× that (default 10/s, burst 50). Heavy requests also take one of 30 per minute, in bursts of up to 10. Heavy are `/v0/series`, `/v0/fees` (not `/v0/fees/<period>`), `/v0/templates`, `/v0/program/<hash>`, and any [proposer or voter](#proposers-and-voters) route taking a round range (`/v0/proposers`, `/v0/proposer/<address>` and its `/stats`, `/v0/payouts/highest`, `/v0/evictions` and `/v0/evictions/<address>`, `/v0/voters`, `/v0/voter/<address>`) when that range, up to the tip, covers 5M rounds (~6 months) or more: by default it is all of history. Over either limit, a request gets **429** with `Retry-After` (seconds). `RATE_LIMIT=0` turns these off.
 
 At most `HEAVY_CONCURRENCY` heavy requests query at once across all clients (default 4); each frees its turn once its query is done, before its reply is sent. One that waits 10 s for a turn gets **503** with `Retry-After`. Every request has 30 s: a query still running then is interrupted and gets **503**. A response must be sent within 2 minutes of the request.
 
 Every response, 429s and 503s included, carries `Access-Control-Allow-Origin: *` and exposes `Retry-After` and `X-Truncated` to browsers.
 
-A `GET` or `HEAD` that succeeds (200) carries `Cache-Control: public, max-age=10`, or `max-age=2` for `/v0/status`; any other reply carries `no-store`, so a 404 for an address not seen yet isn't kept. Browsers honour it. Cloudflare caches JSON only with a Cache Rule making the API hostname eligible for cache, and then it can also answer crawlers that request the same URLs. For the rule: Edge TTL *Use cache-control header if present*, Browser TTL *Respect origin TTL*, and keep the query string in the cache key (else `?ts=X` and `?ts=Y` share an entry). `/robots.txt` allows every crawler, and `/` answers 200.
+A `GET` or `HEAD` that succeeds (200) carries `Cache-Control: public, max-age=10`, or `max-age=2` for `/v0/status` and `max-age=600` for the [specs](#specs) routes; any other reply carries `no-store`, so a 404 for an address not seen yet isn't kept. Browsers honour it. Cloudflare caches JSON only with a Cache Rule making the API hostname eligible for cache, and then it can also answer crawlers that request the same URLs. For the rule: Edge TTL *Use cache-control header if present*, Browser TTL *Respect origin TTL*, and keep the query string in the cache key (else `?ts=X` and `?ts=Y` share an entry). `/robots.txt` allows every crawler, and `/` answers 200.
 
 Behind a proxy every client shares the proxy's address, so set `REAL_IP_HEADER` to the header holding the visitor's IP, e.g. `CF-Connecting-IP` behind a Cloudflare Tunnel. It is read only from a loopback or private peer (cloudflared on the host, in docker or on the LAN), so a client reaching the port directly can't choose its own. A request from such a peer without a valid value is limited by the peer address, with a warning logged once. With Cloudflare, keep the zone's *Remove visitor IP headers* Managed Transform and *Pseudo IPv4* off: the first strips the header, the second puts a made-up IPv4 in it for IPv6 visitors.
 
@@ -432,6 +474,7 @@ Turning `REKEYS` off for a DB that has it is refused (exit 78), so a missing env
 | DUCKDB_MEMORY_LIMIT | DuckDB memory cap, e.g. `2GB`; DuckDB's default is 80% of RAM |  |
 | DUCKDB_THREADS | DuckDB worker threads; 0 for DuckDB's default (every core) | 0 |
 | DB_ID       | systemd unit only: serve `data/<DB_ID>.duckdb` (the dbID argument) | the genesis ID |
+| SPECS_DIR   | A sigreg export directory (`specs.jsonl`, `trees.jsonl`), as an absolute path: enables the [specs](#specs) routes. Not fixed. The systemd unit can't read `/home` | |
 | START_ROUND | Trials only: an empty DB starts at this round ([bulk load](#bulk-load-from-an-archival-nodes-ledger)) | 0 |
 
 `PROPOSERS`, `VOTER_ROUNDS`, `LSIGS` and `MSIGS` are fixed once the DB holds a block: a mismatch is refused at startup. `REKEYS` can be turned on later ([backfill](#backfill)), but not off. To change them, rebuild into a new file (see [bulk load](#bulk-load-from-an-archival-nodes-ledger)). A fees-only DB from before these existed runs with `PROPOSERS=0 VOTER_ROUNDS=0`, and is altered on its first open (two NULL columns added), so back it up first: an older binary can still serve it but no longer ingest into it. A binary from before `LSIGS` ingests into an `LSIGS` DB without noticing, leaving a gap in its logic sigs: rebuild it if that happens. The same goes for a binary from before `MSIGS` on an `MSIGS` DB.

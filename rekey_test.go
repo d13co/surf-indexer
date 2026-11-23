@@ -216,7 +216,7 @@ func TestRekeySetup(t *testing.T) {
 	if code, _ := get("/v0/rekeys/" + addrOf(1)); code != 404 {
 		t.Errorf("rekeys while backfilling = %d, want 404", code)
 	}
-	if _, body := get("/v0/status"); !strings.Contains(body, `"rekeys":false,"backfill":{"rekeys":{"roundsLeft":9}}`) {
+	if _, body := get("/v0/status"); !strings.Contains(body, `"rekeys":false,"specs":false,"backfill":{"rekeys":{"roundsLeft":9}}`) {
 		t.Errorf("status while backfilling = %s", body)
 	}
 	// Ingest past the gap moves next; reopening adds nothing.
@@ -691,7 +691,7 @@ func TestBackfill(t *testing.T) {
 	if code, body := get("/v0/rekeys/" + A); code != 200 || !strings.HasPrefix(body, `{"to":[{`) {
 		t.Errorf("rekeys after the backfill = %d %s", code, body)
 	}
-	if _, body := get("/v0/status"); !strings.Contains(body, `"rekeys":true}`) {
+	if _, body := get("/v0/status"); !strings.Contains(body, `"rekeys":true,"specs":false}`) {
 		t.Errorf("status after the backfill = %s", body)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -39,7 +40,7 @@ var knownEnv = []string{
 	"PORT", "LISTEN_ADDR", "ALGOD_HOST", "ALGOD_PORT", "ALGOD_TOKEN", "CONCURRENCY", "DB_CHUNKS",
 	"LEDGER_DB", "PROPOSERS", "VOTER_ROUNDS", "LSIGS", "MSIGS", "REKEYS", "ADMIN_TOKEN", "RATE_LIMIT",
 	"BACKFILL_ALGOD_HOST", "BACKFILL_ALGOD_PORT", "BACKFILL_ALGOD_TOKEN", "BACKFILL_CONCURRENCY", "BACKFILL_RATE",
-	"HEAVY_CONCURRENCY", "RESULTS_LIMIT", "REAL_IP_HEADER", "START_ROUND", "DUCKDB_MEMORY_LIMIT", "DUCKDB_THREADS",
+	"HEAVY_CONCURRENCY", "RESULTS_LIMIT", "REAL_IP_HEADER", "START_ROUND", "DUCKDB_MEMORY_LIMIT", "DUCKDB_THREADS", "SPECS_DIR",
 	"DB_ID", // read by the unit only, which passes it as the dbID argument
 }
 
@@ -52,6 +53,7 @@ type settings struct {
 	startRound         uint64
 	concurrency, chunk int
 	ledger             string
+	specsDir           string // specsDir
 	backfill           backfillConfig
 	listen             string     // host:port
 	dbOptions          url.Values // DuckDB config options
@@ -107,6 +109,9 @@ func loadConfig() (s settings, err error) {
 	s.startRound = uint64(r.int("START_ROUND", 0, 0, math.MaxUint32))
 	s.concurrency, s.chunk = r.int("CONCURRENCY", 10, 1, math.MaxInt), r.int("DB_CHUNKS", 1000, 1, math.MaxInt)
 	s.ledger = os.Getenv("LEDGER_DB")
+	if s.specsDir = os.Getenv("SPECS_DIR"); s.specsDir != "" && !filepath.IsAbs(s.specsDir) {
+		r.errs = append(r.errs, fmt.Errorf("SPECS_DIR: want an absolute path, got %q", s.specsDir))
+	}
 	// The default rate is gentle on a shared archival algod.
 	s.backfill = backfillConfig{concurrency: r.int("BACKFILL_CONCURRENCY", 4, 1, math.MaxInt), rate: r.int("BACKFILL_RATE", 100, 0, math.MaxInt)}
 	host := strings.TrimSuffix(strings.TrimPrefix(os.Getenv("LISTEN_ADDR"), "["), "]") // JoinHostPort adds an IPv6's brackets
@@ -170,6 +175,17 @@ func readEnvFile(path string) (map[string]string, error) {
 	return env, errors.Join(errs...)
 }
 
+// unitHides reports whether dir is under a directory the systemd unit's ProtectHome=true hides.
+func unitHides(dir string) bool {
+	dir = filepath.Clean(dir)
+	for _, h := range []string{"/home", "/root", "/run/user"} {
+		if dir == h || strings.HasPrefix(dir, h+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // check validates an instance's config, and unless offline, that every algod answers for
 // genesisID. It returns the exit code: 0, exitConfig, or 1 for an algod that doesn't answer.
 func check(args []string) int {
@@ -211,6 +227,21 @@ func check(args []string) int {
 		return fail(exitConfig, "config", err)
 	}
 	fmt.Println("ok   config")
+	// The service would start without specs.jsonl, logging an error and retrying, but check fails:
+	// a missing file is more often a typo than an export not yet made.
+	if s.specsDir != "" {
+		f, err := statSpecFiles(s.specsDir)
+		if err != nil {
+			return fail(exitConfig, "SPECS_DIR", err)
+		}
+		fmt.Printf("ok   specs: %s, %d bytes\n", filepath.Join(s.specsDir, "specs.jsonl"), f.specsSize)
+		if f.treesMtime.IsZero() {
+			fmt.Println("warn specs: no trees.jsonl: /v0/files will be empty")
+		}
+		if unitHides(s.specsDir) {
+			fmt.Printf("warn specs: the systemd unit can't read %s (ProtectHome=true)\n", s.specsDir)
+		}
+	}
 	if *offline {
 		return 0
 	}

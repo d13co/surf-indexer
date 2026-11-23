@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -180,6 +182,16 @@ func tmplID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return id, true
 }
 
+// hexKey returns the {name} path value lowercased, replying 400 unless it is n hex digits.
+func hexKey(w http.ResponseWriter, r *http.Request, name string, n int) (string, bool) {
+	v := strings.ToLower(r.PathValue(name))
+	if !isHex(v, n) {
+		http.Error(w, fmt.Sprintf("%s: want %d hex digits", name, n), http.StatusBadRequest)
+		return "", false
+	}
+	return v, true
+}
+
 // heavyRounds is the round range from which a ranged route is heavy: ~6 months. Over it a
 // proposer's stats take ~13 ms, over all of history ~150 ms.
 const heavyRounds = 5_000_000
@@ -219,6 +231,11 @@ func routes(db *sql.DB) http.Handler {
 			}
 			backfill[f] = progress{n}
 		}
+		// Specs aren't in config (no DB is synced with them): false when off, else the last load.
+		var specs any = false
+		if specsDir != "" {
+			specs = cmp.Or(specsLoaded.Load(), &specStatus{})
+		}
 		reply(w, r, struct {
 			OK       int   `json:"ok"`
 			MaxRound int64 `json:"maxRound"`
@@ -226,8 +243,9 @@ func routes(db *sql.DB) http.Handler {
 			// The most entries a list returns (its limit's cap): a client wanting all asks for this many.
 			ResultsLimit uint64 `json:"resultsLimit"`
 			config
+			Specs    any                 `json:"specs"`
 			Backfill map[string]progress `json:"backfill,omitempty"`
-		}{1, s.hi, s.n, maxLimit, c, backfill}, nil)
+		}{1, s.hi, s.n, maxLimit, c, specs, backfill}, nil)
 	})
 
 	light("GET /v0/block", func(w http.ResponseWriter, r *http.Request) {
@@ -546,6 +564,80 @@ func routes(db *sql.DB) http.Handler {
 		}
 		limited(whenReady, "GET /v0/rekeys/{addr}", rekeysSQL)
 	}
+	if specsDir != "" {
+		// Each takes one key, n hex digits, and answers from the last load. /v0/program and
+		// /v0/selector list at most specsLimit, saying when there were more; an unknown key gets an
+		// empty list, as an address never seen does, but /v0/spec is one spec: 404.
+		const specsLimit = 20
+		// seenList lists a spec's sources from spec_seen: non-mirror first, then those with a commit
+		// (which the browser fetches by), as the loader kept them.
+		const seenList = `list({'owner': owner, 'repo': repo, 'path': path, 'ref': ref, 'refType': ref_type, 'commit': commit, 'mirror': mirror}
+			ORDER BY mirror, commit IS NULL, owner, repo, path, ref_type, ref)`
+		// Specs whose approval or clear program hashes to $1: first those any non-mirror repo holds,
+		// by how many owners do, as copies in a registry repo can be altered. One more than listed is
+		// read to tell whether there were more; the rest is read for the listed alone, with the first
+		// programSeen of each one's sources. Heavy: the rows it ranks grow with the specs that share a
+		// program (a clear program is often every spec's of a compiler version), and fetching sources
+		// from spec_seen costs more the larger it is (~11 ms at 10k specs, ~25 ms at 100k).
+		const rank, programSeen = "owners > 0 DESC, owners DESC, blob, prog", 10
+		programSQL := fmt.Sprintf(`WITH p AS (SELECT blob, prog, owners FROM spec_programs WHERE hash = $1::BLOB ORDER BY %[1]s LIMIT %[2]d + 1),
+			l AS (FROM p ORDER BY %[1]s LIMIT %[2]d),
+			s AS (SELECT blob, kind, name, methods, events, seen FROM specs WHERE blob IN (SELECT blob FROM l)),
+			x AS (SELECT blob, %[3]s[1:%[4]d] AS sl FROM spec_seen WHERE blob IN (SELECT blob FROM l) GROUP BY blob)
+			SELECT coalesce(to_json(list({'blob': blob, 'kind': kind, 'name': name, 'prog': prog, 'methods': methods, 'events': events,
+				'seenTotal': seen, 'seen': coalesce(sl, [])} ORDER BY %[1]s))::VARCHAR, '[]'), (SELECT count(*) FROM p) > %[2]d
+			FROM l JOIN s USING (blob) LEFT JOIN x USING (blob)`, rank, specsLimit, seenList, programSeen)
+		heavy("GET /v0/program/{hash}", func(w http.ResponseWriter, r *http.Request) {
+			k, ok := hexKey(w, r, "hash", 64)
+			if !ok {
+				return
+			}
+			h, _ := hex.DecodeString(k)
+			var s string
+			var more bool
+			err := db.QueryRowContext(r.Context(), programSQL, h).Scan(&s, &more)
+			if err == nil && more {
+				w.Header().Set("X-Truncated", strconv.Itoa(specsLimit))
+			}
+			replyJSON(w, r, s, err)
+		})
+		// Every signature with selector $1, collisions included, by how many distinct owners have it in
+		// a non-mirror repo, then by how many specs do: one repo can make any number of specs. Counted
+		// on load, in spec_sigs.
+		sigs := func(event bool) string {
+			return fmt.Sprintf(`FROM spec_sigs WHERE selector = $1::UINTEGER AND event = %t ORDER BY owners DESC, specs DESC, sig LIMIT %d`, event, specsLimit)
+		}
+		selectorSQL := `SELECT to_json({
+			'methods': coalesce((SELECT list({'sig': sig, 'args': args, 'owners': owners, 'specs': specs} ORDER BY owners DESC, specs DESC, sig)
+				FROM (` + sigs(false) + `)), []),
+			'events': coalesce((SELECT list({'sig': sig, 'owners': owners, 'specs': specs} ORDER BY owners DESC, specs DESC, sig)
+				FROM (` + sigs(true) + `)), []),
+			'truncated': (SELECT count(*) FILTER (WHERE event) > ` + strconv.Itoa(specsLimit) + ` OR count(*) FILTER (WHERE NOT event) > ` + strconv.Itoa(specsLimit) + `
+				FROM spec_sigs WHERE selector = $1::UINTEGER)
+		})::VARCHAR`
+		light("GET /v0/selector/{sel}", func(w http.ResponseWriter, r *http.Request) {
+			if k, ok := hexKey(w, r, "sel", 8); ok {
+				b, _ := hex.DecodeString(k)
+				replySQL(w, r, db, selectorSQL, binary.BigEndian.Uint32(b))
+			}
+		})
+		// Its child rows by the key itself, not joined to specs: a join would read every row. They are
+		// capped on load (maxSpecEntries, maxSpecSeen).
+		specSQL := `SELECT to_json({'kind': kind, 'name': name,
+			'methods': coalesce((SELECT list({'sig': sig, 'args': args, 'readonly': readonly} ORDER BY sig) FROM spec_methods WHERE blob = $1), []),
+			'events': coalesce((SELECT list({'sig': sig} ORDER BY sig) FROM spec_events WHERE blob = $1), []),
+			'seen': coalesce((SELECT ` + seenList + ` FROM spec_seen WHERE blob = $1), [])})::VARCHAR FROM specs WHERE blob = $1`
+		light("GET /v0/spec/{blob}", func(w http.ResponseWriter, r *http.Request) {
+			if k, ok := hexKey(w, r, "blob", 40); ok {
+				replySQL(w, r, db, specSQL, k)
+			}
+		})
+		light("GET /v0/files/{commit}", func(w http.ResponseWriter, r *http.Request) {
+			if k, ok := hexKey(w, r, "commit", 40); ok {
+				replySQL(w, r, db, `SELECT coalesce(to_json(list(path ORDER BY path))::VARCHAR, '[]') FROM spec_files WHERE commit = $1`, k)
+			}
+		})
+	}
 	if track.Proposers || track.VoterRounds > 0 {
 		light("GET /v0/exists/{addr}", func(w http.ResponseWriter, r *http.Request) {
 			if a, ok := addr(w, r); ok {
@@ -652,14 +744,20 @@ var rekeysSQL = func() string {
 var rekeyCounts = []string{`'rekeysTo': (SELECT count(*) FROM rekeys WHERE acct = $1)`,
 	`'rekeysFrom': (SELECT count(*) FILTER (WHERE acct <> $1) FROM rekeys WHERE auth = $1)`}
 
+// specPaths are the spec routes' prefixes: their data changes only when the files are reloaded,
+// checked every 10 minutes.
+var specPaths = []string{"/v0/program/", "/v0/selector/", "/v0/spec/", "/v0/files/"}
+
 // cacheFor is the Cache-Control a GET's (or HEAD's) 200 gets, so browsers and a caching proxy can
-// answer repeats. The tip moves every ~3 s: status is kept for 2 s, the rest for 10 s.
+// answer repeats. The tip moves every ~3 s: status is kept for 2 s, specs for 10 minutes, the rest for 10 s.
 func cacheFor(r *http.Request) string {
 	switch {
 	case r.Method != http.MethodGet && r.Method != http.MethodHead:
 		return ""
 	case r.URL.Path == "/v0/status":
 		return "public, max-age=2"
+	case slices.ContainsFunc(specPaths, func(p string) bool { return strings.HasPrefix(r.URL.Path, p) }):
+		return "public, max-age=600"
 	}
 	return "public, max-age=10"
 }

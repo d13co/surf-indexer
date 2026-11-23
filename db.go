@@ -134,6 +134,12 @@ func openDB(path, genesisID string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if specsDir != "" {
+		if err = loadSpecStatus(context.Background(), db); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	return db, nil
 }
 
@@ -200,6 +206,11 @@ func setup(db *sql.DB, path, genesisID string) error {
 		_, err = tx.Exec(msigTable)
 	} else if err == nil {
 		_, err = tx.Exec("DROP TABLE IF EXISTS msig_signers")
+	}
+	if err == nil && specsDir != "" { // not in config: the files rebuild them, so turning it off just drops them
+		err = setupSpecTables(tx)
+	} else if err == nil {
+		_, err = tx.Exec(dropSpecTables)
 	}
 	for _, j := range allJobs {
 		if err == nil {
