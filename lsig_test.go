@@ -103,10 +103,13 @@ func TestTemplate(t *testing.T) {
 		}
 		same(fmt.Sprintf("op %#x", op), p(1), p(2))
 	}
-	// falcon_verify has no immediate through v13.
+	// falcon_verify has no immediate through v13, and a FalconConfigs field from v14; rsa_verify (v14) a field too.
 	same("falcon_verify v13", []byte{13, 0x85, 0x81, 5}, []byte{13, 0x85, 0x81, 7})
-	// A truncated program, or a version past the table (v14 is still vFuture), is its own template.
-	differ("v14", []byte{14, 0x81, 5}, []byte{14, 0x81, 7})
+	same("falcon_verify v14", []byte{14, 0x85, 0, 0x81, 5}, []byte{14, 0x85, 0, 0x81, 7})
+	differ("falcon_verify v14 field", []byte{14, 0x85, 0, 0x81, 5}, []byte{14, 0x85, 1, 0x81, 5})
+	same("rsa_verify v14", []byte{14, 0xe8, 0, 0x80, 1, 'a'}, []byte{14, 0xe8, 0, 0x80, 2, 'b', 'c'})
+	same("v14", []byte{14, 0x81, 5}, []byte{14, 0x81, 7})
+	// A truncated program, or a version past the table, is its own template.
 	full := v6(5, addr, 7)
 	differ("truncated in bytecblock", full, full[:12])
 	differ("truncated, same prefix", full[:12], full[:13])
